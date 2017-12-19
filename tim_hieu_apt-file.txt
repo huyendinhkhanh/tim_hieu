@@ -1,0 +1,38 @@
+﻿Tìm hiểu
+apt-file
+- apt-file tool có thể liệt kê, tìm kiếm trong từng file của software packages được dùng bởi APT. 
+ + thường dùng cho dpkg-L nhưng apt-file có thể tìm kiếm mọi available packages chứ không chỉ những package đã install.
+- Cài đặt:
+ + "sudo apt update && sudo apt install apt-file"
+ + khi một cửa sổ hiện ra, click "Run this action now" hoặc trong terminal : "sudo apt-file update && apt-file update".
+- Cú pháp:
+ + "apt-file [options] [action] [pattern]"
+ + "apt-file -f [options] search [file...]"
+ + "apt-file -D [options] search [debian-package-name.deb...]"
+- Với: 
+ + find: giống như "search"
+ + list:
+ + purge:
+ + search:
+ + show: giống "list"
+ + update:
+- Options:
+ + "-a arch, --architecture arch":
+ + "-c cache-dir, --cache cache-dir":
+ + "-d mnt-point, --cdrom-mount mnt-point":
+ + "-D, --from-deb":
+ + "-f, --from-file":
+ + "-F, --fixed-string":
+ + "-i, --ignore-case":
+ + "-I, --package-only":
+ + "-N, --non-interactive":
+ + "-s sources.list, --sources-list sources.list":
+ + "-v, --verbose":
+ + "-x, --regexp":
+ + "-y, --dummy":
+ + "-h, --help":
+- Thư mục và files có liên quan:
+ + "/etc/apt/apt-file.conf": file cấu hình apt-file default.
+ + "/var/cache/apt/apt-file/": system-wide apt-file cache.
+ + "~/.cache/apt-file/": user apt-file cache.
+ + "/etc/apt/sources.list[.d]" defautl APT sources list.

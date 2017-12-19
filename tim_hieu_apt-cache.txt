@@ -1,0 +1,65 @@
+﻿Tìm hiểu
+1. apt-cache
+- apt-cache là một package cache của Advanced Packaging Tool (APT) 
+- được dùng để tìm kiếm cho packages và package names
+- Cú pháp:
+"apt-cache [-agipns] [-o=config_string] [-c=config_file]
+          {gencaches | showpkg pkg... | showsrc pkg... |
+          stats | dump | dumpavail | unmet | search regex... |
+          show pkg [{=pkg_version_number | /target_release}]... |
+          depends pkg [{=pkg_version_number | /target_release}]... |
+          rdepends pkg [{=pkg_version_number | /target_release}]... |
+          pkgnames [prefix] | dotty pkg [{=pkg_version_number |
+          /target_release}]... | xvcg pkg [{=pkg_version_number |
+          /target_release}]... | policy [pkg...] | madison pkg... |
+          {-v | --version} | {-h | --help}}"
+
+Với:
++ gemcaches: tạo (lại) package cache của APT
++ showpkg pkg: hiển thị thông tin tóm tắt về package đó (tên, ver, reverse depend (dựa trên package này, không được install theo package đó), dependencies (những package khác mà package này dựa theo, phải được install cùng package này), provides, reverse provides...)
++ stats: thống kê một số thông tin về package đó:
+   * Total package names: số lượng tên package được tìm thấy trong cache
+   * Normal packages: số lượng regular, ordinary (bình thường) package names; gồm những packages có tên tương đồng, tên của những package khác trong dependencies (hầu hết package đều có tên trong mục này)
+   * Pure virtual packages: số lượng package có tên thực sự (virtual) (không có package khác trùng tên)
+   * Single virtual packages: số lượng package với chỉ một package providing a particular virtual package.
+   * Mixed virtual package:
+   * Missing: số lượng tên package được liệt kê trong dependency nhưng không provided bởi package nào (lỗi do Conflict hoặc Breaks statements)
+   * Total distinct versions: số ver của package được tìm thấy trong cache.
+   * Total dependencies: số lượng dependency relationships được yêu cầu bởi tất cả các package trong cache.
++ showsrc pkg...: hiển thị tất cả source của các package khớp với package names (tất cả các ver)
++ dump: hiển thị một list rút gọn của tất cả các package trong cache (dùng để debugging).
++ dumpavail: in ra một list đến stdout (dùng với dpkg và dùng bởi hàm dselect).
++ unmet: hiển thị một bản rút gọn của các dependencies không được thoả mãn trong package cache.
+show pkg: hiển thị performs a function giống "dpkg --print-avail"
++ search regex...:
++ depends pkg...:
++ rdepends pkg...:
++ pkgnames [prefix]:
++ dotty pkg:
++ xvcg pkg...:
++ policy [pkg...]:
++ madison pkg...:
+- Options:
+ + "-p, --pkg-cache"
+ + "-sm --src-cache"
+ + "-q, --quiet"
+ + "-i, --important"
+ + "--no-pre-depends"
+ + "--no-depends"
+ + "--no-pre-depends, --no-depends, --no-recommends, --no-suggests, --no-conflicts, --no-breaks, --no-replaces, --no-enhances"
+ + "-f, --full"
+ + "-a, --all-versions"
+ + "-g, -generate"
+ + "-names-only, -n"
+ + "--all-names"
+ + "--recurse"
+ + "--installed"
+ + "-h, --help"
+ + "-v, --version"
+ + "-c, --config-file"
+ + "-o, --option"
+- Files:
+ + "/etc/apt/sources.list/": Locations to fetch packages from.
+ + "/etc/apt/sources.list.d/": File fragments for locations to fetch packages from.
+ + "/var/lib/apt/lists/": Storage area for state information for each package resource specified in sources.list.
+ + "/var/lib/apt/lists/partial/": Storage area for state information in transit.
