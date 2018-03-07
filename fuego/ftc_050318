@@ -1,0 +1,4033 @@
+#!/usr/bin/python
+#
+# vim: set ts=4 sw=4 et :
+#
+# ftc - 'fuego test control' - a tool for operating fuego from the
+# the command line
+#
+# some material, and lots of style, copied from ttc
+#
+# Copyright 2016,2017 Sony Corporation
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of version 2 of the GNU General Public License as
+#   published by the Free Software Foundation.  The GNU General Public
+#   License is available online at: http://www.gnu.org/copyleft/gpl.html
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+# Author: Tim Bird  <tim.bird (at) sony.com>
+#
+# To Do:
+# - add do_run_request - to run a job request from the server
+#    if no arguments, run the next available request on the server
+# - finish do_run_test
+#    - support flags: Reboot, Target_Cleanup, Rebuild
+#    - get log results into file (switch to subprocess?)
+#    - make Jenkins recognize ftc test result
+# - finish do_set
+#    - set a function override (override-func)
+# - finish do_delete
+#    - delete a function override (override-func)
+# - add do_query_test
+# - add do_remove_test
+# - finish converting commands to 'verb-object' format
+#    verbs: list, get, set, install, query, delete, run, package
+#    objects: board, host, test, request, run, plan (testplan), spec?
+# - change name of target_removal_flag
+
+import os, sys, string, re
+import time
+import commands
+from shutil import copy2, rmtree
+from lxml import etree
+import io
+import subprocess
+import signal
+import fcntl
+import requests
+import json
+import getopt
+import shutil
+import tempfile
+import yaml
+import jenkins
+import glob
+
+# MAJOR, MINOR, REVISION
+VERSION = (1,2,1)
+
+# define these as globals
+log = None
+tail_fd = None
+
+# here's a utility routine to print a variable with it's name and value
+def pvar(name):
+    caller = sys._getframe(1)
+    print "DEBUG: python var %s=%s" % (name, caller.f_locals[name])
+
+quiet = 0
+verbose = 0
+server = jenkins.Jenkins('http://localhost:8080/fuego')
+
+# keep configuration file in /fuego-ro/conf area
+config_dir = "/fuego-ro"
+CONFIG_FILE = "ftc.conf"
+
+# This is the name of the environment variable
+# used to keep track of the current board
+BOARD_ENV_VAR="FTC_BOARD"
+
+# format for command_help mapping with: key=name, value=(summary, long description)
+command_help = {
+"add-jobs":("Adds jobs to Jenkins.",
+    """Usage: ftc add-jobs -b <board>[,board2...] [-p <testplan> | -t <testcase> -s <testspec> [-k <kill timeout>] [--rebuild <true|false>]
+  Example: ftc add-jobs -b docker -p testplan_docker
+  Example: ftc add-jobs -b docker -t Benchmark.Dhrystone -k 5m --rebuild false
+  Use list-plans to see the available test plans.
+
+  Note that you can specify more than one board using a comma-separated
+  list for the <board> argument. e.g.
+     ftc add-jobs -b board1,board2 -t Functional.foo
+
+  This interface may change in the future."""),
+
+"rm-jobs":("Removes jobs from Jenkins.",
+    """Usage: ftc rm-jobs [--remove-logs] <board>.<testspec>.<testtype>.<testcase>
+  Use list-jobs to see the existing jobs. A wildcard can be used to
+  specify which jobs to remove (just make sure you have 4 words):
+    Example: ftc rm-jobs "docker.testplan_docker.*.*"
+    Example: ftc rm-jobs "docker.*.F*.*stress"
+  Multiple combinations of the <board>.<testspec>.<testtype>.<testcase>
+  pattern can be passed as well. The option --remove-logs will additionally
+  remove the corresponding log files in the log directory. If no job is
+  provided all existing jobs will be removed.
+    Example: ftc rm-jobs --remove-logs
+  """),
+
+"add-nodes":("Adds new nodes to Jenkins.",
+    """Usage: ftc add-nodes [-f] <board1> <board2> ...
+  By convention the name of the node and board is the same. Also,
+  the corresponding board file (<board_name>.board) must exist.
+  Use list-boards to see available boards.
+
+  Use -f for "force" mode. This tries to remove the node before adding it"""),
+
+"rm-nodes":("Removes nodes from Jenkins.",
+    """Usage: ftc rm-nodes [<node1> <node2> ...]
+  Use list-nodes to see the existing nodes.
+
+  If no node is provided all existing nodes will be removed."""),
+
+"list-boards":("Show a list of available boards.",
+    """Usage: ftc list-boards [-q]
+  Prints board names and summary information, if any.
+
+  Use -q for "quiet" mode.  This prints only the board names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"list-tests":("Show a list of available tests.",
+    """Usage: ftc list-tests [-q]
+  Prints test names and summary information, if any.
+
+  Use -q for "quiet" mode.  This prints only the board names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"list-plans":("Show a list of available testplans.",
+    """Usage: ftc list-plans [-q]
+  Prints available testplans, if any.
+
+  Use -q for "quiet" mode.  This prints only the plan names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"list-specs":("Show a list of available testspecs for a test.",
+    """Usage: ftc [-q] list-specs -t <testcase>
+  Prints available testspecs for a test, if any.
+
+  Use -q for "quiet" mode.  This prints only the spec names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"list-runs":("Show a list of test runs.",
+    """Usage: ftc list-runs [-q] [--where <where-clause1>[,<where_clausen>]...]
+  Prints run names and summary information, if any.
+
+  Use -q for "quiet" mode.  This prints only the run names, with no
+  additional information.
+
+  The --where option can be used to specify one or more 'where' specifiers
+  to filter the list of runs. Each where clause is separated by a comma.
+  A 'where clause' consists of a field_name, an operator and a value.
+  Allowed field names are: test, type, spec, board, status and batch_id.
+  Allowed operators are: '=','<','<=','>','>=','!=','=~'.  The '=~' operator
+  means the value is a regular expression to match, for the indicated field.
+  Here are some example where options:
+     --where test=LTP
+     --where test=bonnie,board=beaglebone
+     --where "start_time>2 hours ago"
+  """),
+
+"list-nodes":("Show a list of configured jenkins nodes.",
+    """Usage: ftc list-nodes [-q]
+  Prints node names.
+
+  Use -q for "quiet" mode.  This prints only the node names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"list-jobs":("Show a list of configured jenkins jobs.",
+    """Usage: ftc list-jobs [-q]
+  Prints job names.
+
+  Use -q for "quiet" mode.  This prints only the job names, with no
+  additional information. This is suitable for piping to other commands."""),
+
+"query-board":("Show information about a board.",
+    """Usage: ftc query-board  <board> [-v] [-n <attr>]
+  Show information about an object.  The '-v' (verbose) option will show
+  all the attributes of the object.  Use the '-n' option
+  to display the value of a single attribute, <attr>."""),
+
+"help":("Show this online help.",
+    """Usage: ftc help [<command>]
+  If a command is specified, show the usage information for that command."""),
+
+"version":("Show version information and exit.",""),
+
+"put-request":("Put a new test request on the server.",
+    """Usage: ftc put-request <host>:<board> <test> [<plan>] [options]
+Put a request on the server to run the indicated test on the specified board.
+Use the specified testplan if one is provided.
+
+The first argument should specify the board in host:board format.
+Other options are:
+  -R   Reboot the board prior to the test."""),
+
+"put-test":("Put a test on the server.",
+   """Usage: ftc put-test [<test>|<test_file>]
+Put a test on the server.  The test can be an existing test file
+(created with 'ftc package-test' or the name of a test on the local system.
+In the latter case, the test will be packaged into a '.ftp' file and sent
+to the server."""),
+
+"put-run":("Put a run on the server.",
+    """Usage: ftc put-run [<run_id>|<run_file>]
+Put a run on the server.  The run can be an existing run file
+(created with 'ftc package-run' or the name of a run on the local system.
+In the latter case, the test will be packaged into a '.frp' file and sent
+to the server.
+
+You can obtain a list of run_ids for runs on the local system with
+  ftc list-runs -q"""),
+
+"run-test":("Run a test on the board.",
+    """Usage: ftc run-test -b <board> -t <test> [-s <spec>] [-p <phases>]
+Run the indicated test on the specified board.  Use the
+indicated spec, if one is provided.
+
+A list of phase characters may be provided, to execute only those phases
+  p = pre_test, c=pre_check, b=build, d=deploy, r=run,
+  t = post_test, a=processing
+
+Specify a list of characters corresponding to the phases you want to execute.
+  ex: ftc run-test -b myboard -t Functional.mytest -p pcbd
+would run the pre_test, pre_check, build and deploy phases of the test.
+
+This is useful during development of a test (ie. for testing tests).
+Use caution running later phases of a test without their normal
+precursors (e.g. run, without build or deploy).
+"""),
+
+"build-jobs":("Build one or more jobs (to execute tests) in Jenkins.",
+    """Usage: ftc build-jobs <job_name> [<job_name2> ...]
+Build the indicated job(s).
+
+  Use list-jobs to see the existing jobs. A wildcard can be used to
+  specify which jobs to build (just make sure you have 4 words):
+    Example: ftc build-jobs "docker.testplan_docker.*.*"
+    Example: ftc build-jobs "docker.*.F*.*stress"
+  Multiple job_name patterns can be specified."""),
+
+"add-view":("Add view to Jenkins dashboard",
+    """Usage: ftc add-view <view-name> [<job_spec>]
+Add a new view to Jenkins, using the provided job specification.
+If the job specification starts with "=", it is a comma-separated
+list of job names.  If not, then it is used as a regular expression.
+If no job spec is specified, then the view is created by adding
+wildcards to the beginning and ending of the view-name
+   Example: ftc add-view batch ".*.batch"
+   Example: ftc add-view network =docker.default.Functional.ipv6connect,docker.default.Functional.netperf
+   Example: ftc add-view LTP
+
+This last command would add a view with a name of 'LTP' and
+a job_spec of ".*LTP.*"
+"""),
+
+"run-request":("Run a test request.",
+    """Usage: ftc run-request [<request_id>]
+
+The request_id can be a filename (ending in .json), or a request identifier
+on the server.  If the request_id is 'next' or is missing, then the next
+available request on the sever is run."""),
+
+"set-var":("Set the value of a variable for a board.",
+    """Usage: ftc set-var <board> VAR=value
+
+To set a function, put the entire function definition on one line, using
+'\\n' and '\\t', like so:
+ftc <board> set-var "function myfunc() {\\n\techo \\"hello from myfunc\\"\\n\\tls -l\\n}"
+This would create the defintion:
+function myfunc() {
+    echo "hello from myfunc"
+    ls -l
+}
+in the board file for the indicated board."""),
+
+"delete-var":("Delete a variable from a board.",
+    """Usage: ftc delete-var <board> [<VAR>|<function_name>]
+
+Where VAR is the variable name, or function_name is the name
+of the function prefixed with "function_".  In other words, to remove
+the 'foo' function from the board file, you would use do this:
+   ftc delete-var <board> function_foo
+"""),
+
+"gen-report":("Generate a report from a set of runs",
+    """Usage: ftc gen-report [--where <where-clause1>[,<where_clausen>]...] \\
+            [--format [txt|html|pdf|excel|csv]] \\
+            [--layout <report_name>]
+
+  Generates a report from test run data as specified.  The where option
+  controls which runs are included in the report.  The format option controls
+  the text encoding of the report, and the layout specifies a report style.
+  If no arguments are provided, the defaults of "all tests", "txt" output,
+  and a layout consisting of summary results is used.
+
+  The --where option can be used to specify one or more 'where' specifiers
+  to filter the list of runs. Each where clause is separated by a comma.
+  A 'where clause' consists of a field_name, an operator and a value.
+  Allowed field names are: test, type, spec, board, status and batch_id.
+  Allowed operators are: '=','<','<=','>','>=','!=','=~'.  The '=~' operator
+  means the value is a regular expression to match, for the indicated field.
+  Here are some example where options:
+     --where test=LTP
+     --where test=bonnie,board=beaglebone
+     --where "start_time>2 hours ago"
+     --where batch_id=12
+  """),
+
+"wait-for":("Wait for a condition to be true.",
+    """Usage: ftc wait-for [-i <interval>] [-t <timeout>] <command>
+
+ The command is run periodically until it returns 0.  By default,
+ the interval between executing the command is 5 seconds.
+ Use -i to specify a different interval, and -t to specify a
+ maximum time to wait.  Both are expressed in seconds.
+
+   ex: ftc wait-for -i 2 -t 100 "test -f /tmp/outfile"
+
+ This will check every two seconds to see if /tmp/outfile exists,
+ waiting no longer than 100 seconds total. The exit code from
+ 'ftc' is the exit code of the last invocation of the
+ command (0 on success)."""),
+
+"package-test":("Package a test.",
+    """Usage: ftc package-test <test_name> [options]
+
+Creates a package for the indicated test.  There must be a valid test.yaml
+file in the test directory, which is used to package the test.
+
+This produces a test package with the name:
+   <test_name>-<version>-<release>.ftp
+
+Options are:
+ -o <output_dir>  Place the resulting package in the indicated directory.
+                  If not specified, the test package is created in the current directory.
+ -f               Force overwrite of existing package."""),
+
+"package-run":("Package a run.",
+    """Usage: ftc package-run <run_id> [options]
+
+Creates a package for the indicated run.  There must be a valid run.json
+file in the run directory, which is used to package the run.
+
+This produces a test package with the name:
+   run-<timestamp>-<test_name>-<host>:<board>.frp
+
+Options are:
+ -o <output_dir>  Place the resulting package in the indicated directory.
+                  If not specified, the run package is created in the current directory.
+ -f               Force overwrite of existing package."""),
+
+"install-test":("Install a test from a package.",
+    """Usage: ftc install-test [-u] <test_pkg>
+
+Installs the indicated test package.  Package names usually end
+in the extension .ftp (for 'fuego test package').
+
+If -u is specified, then upgrade the package.
+If the test is already installed, and -u is not specified, the
+installation will fail.  If the test is not installed, -u has no effect.
+"""),
+
+"list-requests":("List requests matching a criteria, from the test server.",
+    """Usage: ftc list-requests [<criteria> ...]
+
+Lookup requests on a server, finding matches for specific criteria.
+Each criteria is specified as string containing <name>=<value>, such as:
+host=tims_desktop.  Asterisk (*) may be used at the beginning or end
+of the value, to indicate a wildcard match.
+
+Allowed names are: 'host', 'board'.
+
+If no criteria are specified, a default criters is used,
+which is "host=<local_host_name>". Use "host=*" o see all hosts.
+
+ex: ftc list-requests host=tims_desktop board=
+
+The result is a list of request that match the criteria.  If no
+criteria are specified, all requests on the server are listed.
+"""),
+
+}
+
+# ftc configuration (ftc.conf) file syntax:
+# ------------------------
+# empty lines and lines starting with # are ignored
+# single-line attributes are:
+# name=value
+# multi-line attributes are:
+# name="""value line 1
+# value line 2, etc."""
+class config_class:
+    def __init__(self, config_path):
+        # start of default configs
+        # only items defined here can be redefined by the config file
+        self.FUEGO_CORE = "/fuego-core"
+        self.FUEGO_RO = "/fuego-ro"
+        self.FUEGO_RW = "/fuego-rw"
+
+        self.JENKINS_HOME = "/var/lib/jenkins"
+
+        # fuegotest.com is at: 52.88.166.49
+        self.SERVER_URL_BASE = "http://52.88.166.49/server/Fuego_Server?action=Fuego."
+        self.JENKINS_URL = "http://localhost:8080/fuego"
+
+        # end of default configs
+
+        self.host = "timdesk"
+
+        # FIXTHIS - config_class should read from ftc.conf (ignore for now)
+        # should be able to completely remove this, if we never use
+        # anything more than default config values
+        return
+
+#       # look in configuration directory
+#       # FIXTHIS - use a library function for this (when we get back to it)
+#       conf_map = parse_conf(config_path)
+
+def usage(rcode, options=[]):
+    command = ""
+    if len(options):
+        command = options[0]
+
+    # check if command is legal
+    if command and command not in command_help.keys():
+        print "Unknown command: %s" % command
+        command = ""
+        # drop through to showing list of commands
+
+    if not command:
+        # show list of commands
+        print """Usage: ftc [global_options] command [options]
+
+Here are the available global options:
+ -h, --help     Show this usage help
+ -v             Be verbose
+ -q             Be quiet
+ -c             Use internal command (not 'system') to execute shell commands
+
+command is one of:
+"""
+        command_list = command_help.keys()
+        command_list.sort()
+        for command in command_list:
+            print "  %13s %s" % (command, command_help[command][0])
+    else:
+        # print help for individual command
+        print "ftc %s: %s" % (command, command_help[command][0])
+        print
+        print command_help[command][1]
+
+    sys.exit(rcode)
+
+class map_class:
+    def __init__(self, map):
+        self.map = map
+    def __getattr__(self, attr):
+        if self.map.has_key(attr):
+            return self.map[attr]
+
+def print_error(message):
+    sys.stderr.write("Error: "+message+"\n")
+    sys.stderr.flush()
+
+def error_out(message, rcode=1):
+    print_error(message)
+    sys.exit(rcode)
+
+class board_class:
+    def __init__(self, name, board_path, dist_path, env_vars):
+        self.name = name
+        self.board_path = board_path
+        self.dist_path = dist_path
+        if env_vars:
+            self.env_vars = env_vars
+        else:
+            self.env_vars = {}
+
+    # FIXTHIS - board_class should have methods to read board and dist file
+class plantest_class:
+    def __init__(self, test_dict, defaults):
+        self.name = str(test_dict["testName"])
+        self.test_type = self.name.split(".")[0]
+        self.base_name = self.name.split(".")[1]
+        self.spec = str(test_dict.get("spec", defaults['spec']))
+        self.timeout = str(test_dict.get("timeout", defaults['timeout']))
+        self.reboot = str(test_dict.get("reboot", defaults['reboot']))
+        self.rebuild = str(test_dict.get("rebuild", defaults['rebuild']))
+        self.precleanup = str(test_dict.get("precleanup", defaults['precleanup']))
+        self.postcleanup = str(test_dict.get("postcleanup", defaults['postcleanup']))
+
+class run_class:
+    def __init__(self, conf, spec, test_name, host, board, rundir, num):
+        # FIXTHIS - run_class is not up-to-date with fuego-schema.json
+        self.spec = spec
+        self.test_name = test_name
+        self.type = test_name.split(".")[0]
+        self.test = test_name.split(".")[1]
+        self.host = host
+        self.board = board
+        self.rundir = rundir    # place with run.json file and console log
+        self.builddir = "not set"    # place with build.xml file and console log
+        self.logpath = conf.FUEGO_RW+"/logs/%s/%s.%s.%s" % (test_name, spec, num, num)
+        self.num = num          # jenkins local run number
+        self.run_id = "%s-%s-%s-%s" % (test_name, spec, num, board)
+        self.global_run_id = "%s-%s-%s-on-%s:%s" % (test_name, spec, num, host, board)
+        self.status = "<data not loaded>"
+        self.json_data = "<data not loaded>"
+        self.timestamp = "<data not loaded>"
+        self.tguid_list = []
+        self.run_data = None
+
+    def get_devlog_path(self):
+        return self.logpath+"/devlog.txt"
+
+    def get_systemlog_path(self, suffix):
+        # suffix should be "before" or "after"
+        return self.logpath+"/syslog.%s.txt" % suffix
+
+    def get_testlog_path(self):
+        return self.logpath+"/testlog.txt"
+
+    def get_buildxml_path(self):
+        return self.builddir+"/build.xml"
+
+    def get_consolelog_path(self):
+        return self.logpath+"/consolelog.txt"
+
+    def get_run_data_from_buildxml(self):
+        xml_path = self.get_buildxml_path()
+        root = etree.parse(xml_path)
+
+        #print etree.tostring(root)
+
+        # get simple fields
+        fields = ["number", "startTime", "result", "description", "duration",
+            "charset", "keepLog", "builtOn", "workspace"]
+        for field in fields:
+            value = root.findtext("%s" % field)
+            print "simple field %s=%s" % (field, value)
+            self.__dict__[field] = value
+
+        # get complex fields
+        # get parameters/hudson.model.StringParameterValue/value
+        #print "String Parameters:"
+        string_elems = root.findall("//hudson.model.StringParameterValue")
+        for str_elem in string_elems:
+            field = str_elem.findtext("name")
+            value = str_elem.findtext("value")
+            #print "  %s=%s" % (field, value)
+            self.__dict__[field] = value
+
+        #print "Boolean Parameters:"
+        bool_elems = root.findall("//hudson.model.BooleanParameterValue")
+        for b_elem in bool_elems:
+            field = b_elem.findtext("name")
+            value = b_elem.findtext("value")
+            #print "  %s=%s" % (field, value)
+            self.__dict__[field] = value
+
+        #print "Cause Actions:"
+        c_elem = root.find("//causes")
+        c_children = c_elem.getchildren()
+        if len(c_children):
+            value = c_children[0].tag
+            #print "  cause=%s" % value
+            self.cause = value
+
+        # FIXTHIS - in run_class, convert build.xml startTime from seconds to timestamp
+
+        # lower-case some things:
+        for key in ["TESTPLAN", "Reboot", "Rebuild", "Target_Cleanup", "Device"]:
+            lkey = key.lower()
+            try:
+                self.__dict__[lkey] = self.__dict__[key]
+                del self.__dict__[key]
+            except:
+                pass
+
+        # do some other name conversions:
+        for (key1, key2) in [("startTime", "start_time"),
+                ("keepLog", "keep_log"),
+                ("builtOn", "built_on")]:
+            try:
+                self.__dict__[key2] = self.__dict__[key1]
+                del self.__dict__[key1]
+            except:
+                pass
+
+    def set_run_data(self, build_data):
+        # fields with same name
+        fields = ["start_time","result", "description", "duration",
+            "charset", "keep_log", "built_on", "workspace",
+        ]
+
+        # renamed fields
+        fields2 = [("build_number", "number"),
+                ("testplan_name", "testplan"),
+                ("reboot_flag", "reboot"),
+                ("rebuild_flag", "rebuild"),
+                ("target_cleanup_flag", "target_cleanup"),
+                ("board_name", "device"),
+        ]
+
+        for field in fields:
+            try:
+                value = build_data[field]
+                self.__dict__[field] = value
+            except:
+                print "Warning: build_data is missing field %s" % field
+
+        # do renamed fields
+        for src_field, dest_field in fields2:
+            try:
+                value = build_data[src_field]
+                self.__dict__[dest_field] = value
+            except:
+                print "Warning: build_data is missing field %s" % src_field
+
+    def write_run_json_file(self, output_dir="."):
+        # FIXTHIS - run_class is not up-to-date with fuego-schema.json
+        self.files = ["devlog.txt", "syslog.before.txt", "syslog.after.txt",
+            "testlog.txt", "consolelog.txt", "build.xml"]
+        keylist = ["test_name", "timestamp", "num","host", "board",
+            "result", "device", "reboot", "rebuild", "testplan", "target_cleanup",
+            "start_time", "description", "duration", "charset", "keep_log",
+            "built_on", "workspace", "cause",
+            "files"]
+
+        run_map = {}
+        for key in keylist:
+            try:
+                run_map[key] = self.__dict__[key]
+            except:
+                run_map[key] = "unknown"
+
+        jpath = output_dir+os.sep+"run.json"
+        outfile = open(jpath, "w")
+        json.dump(run_map, outfile, sort_keys=True, indent=4, ensure_ascii=False)
+        outfile.close()
+
+    def get_run_data_from_json_file(self):
+        import datetime
+        jpath = self.rundir+os.sep+"run.json"
+        if not os.path.isfile(jpath):
+            # FIXTHIS - hold warning for now - reenable when base script writes the run.json file
+            #print ("Warning: missing run.json file for run %s" % self.run_id)
+            return
+
+        infile = open(jpath, "r")
+        run_data = json.load(infile)
+        infile.close()
+
+        self.run_data = run_data
+
+        # FIXTHIS - should probably load more instance data here
+        self.status = run_data["status"]
+        self.start_time = run_data["metadata"]["start_time"]
+        self.build_number = run_data["metadata"]["build_number"]
+
+        # convert start time to human-readable timestamp
+        # FIXTHIS add timestamp to run.json file
+        dt = datetime.datetime.fromtimestamp(float(self.start_time)/1000)
+        self.timestamp = dt.strftime('%Y-%m-%d_%H:%M:%S')
+
+    def get_tguid_name(self, test_set, test_case, measure = ""):
+        # if set is 'default', leave it empty
+        # if measure is empty, don't put on trailing '.'
+        if test_set=="default":
+            test_set = ""
+        else:
+            test_set += "."
+        if measure:
+            measure = "."+measure
+        return test_set + test_case + measure
+
+    def lookup_tguid(self, tguid_name):
+        # abort if there's no test data
+        try:
+            test_sets = self.run_data["test_sets"]
+        except:
+            return None
+
+        parts = tguid_name.split(".")
+
+        # if run has a test_set of 'default', assume tguid is in that set
+        # otherwise, use first part of tguid as test set
+        ts_match = None
+        for ts in test_sets:
+            if ts["name"] == "default":
+                ts_match = ts
+                if parts[0]=="default":
+                    del parts[0]
+                break
+        if not ts_match:
+            ts_candidate = parts[0]
+            for ts in test_sets:
+                if ts["name"] == ts_candidate:
+                    ts_match = ts
+                    del parts[0]
+                    break
+        if not ts_match:
+            return None
+
+        # OK - we've got a test_set match, if no more parts we're done
+        if not parts:
+            return ts_match
+
+        # now look up test case in the test set
+        # this is tricky, as test_case name can be multi-part
+        tc_candidate=parts[0]
+        del parts[0]
+
+        tc_match = None
+        while True:
+            for tc in ts_match["test_cases"]:
+                if tc["name"] == tc_candidate:
+                    tc_match = tc
+                    break
+
+            if tc_match:
+                break
+
+            if len(parts):
+                tc_candidate += "." + parts[0]
+                del parts[0]
+            else:
+                break
+
+        if not tc_match:
+            return None
+
+        # OK - we've got a test_case match, if no more parts we're done
+        if not parts:
+            return tc_match
+
+        # otherwise, check for a measure name
+        # measurement can not be multi-part
+        if len(parts) != 1:
+            return None
+
+        try:
+            measurements = tc_match["measurements"]
+        except:
+            # there's more in the tguid, but there are no measurements to match
+            return None
+
+        m_candidate = parts[0]
+        for m in measurements:
+            if m["name"] == m_candidate:
+                return m
+
+        # OK - nothing matched
+        return None
+
+    def get_field(self, field, tguid=""):
+        # NOTE: 'result' value for test_set and test_case is 'status'
+        #  'result' for measure is 'measure'
+
+        if not tguid:
+            # look up a simple attribute
+            if self.__dict__.has_key(field):
+                return self.__dict__[field]
+            else:
+                # interpret the field as a tguid
+                tguid = field
+                field = "result"
+
+        item = self.lookup_tguid(tguid)
+        value = None
+        if item:
+            if field=="result":
+                if item.has_key("measure"):
+                    value = item["measure"]
+                else:
+                    value = item["status"]
+            else:
+                try:
+                    value = item[field]
+                except:
+                    pass
+
+        #if not value:
+        #    print("Warning: attribute '%s' not found in run data" % field)
+        return value
+
+    def gen_tguid_list(self):
+        tlist = []
+        # test sets is an array of maps
+        try:
+            test_sets = self.run_data["test_sets"]
+        except:
+            return tlist
+        for test_set in test_sets:
+            ts_name = test_set["name"]
+            tlist.append(ts_name)
+            test_cases = test_set["test_cases"]
+            for test_case in test_cases:
+                tc_name = test_case["name"]
+                if test_case.has_key("measurements"):
+                    measurements = test_case["measurements"]
+                    for measure in measurements:
+                        m_name = measure["name"]
+                        tlist.append(self.get_tguid_name(ts_name, tc_name, m_name))
+                tlist.append(self.get_tguid_name(ts_name, tc_name))
+        return tlist
+
+    # get next tguid from this run
+    def next_tguid(self, prev_tguid):
+            if not self.tguid_list:
+                # generate the list of tguids for the run
+                self.tguid_list = self.gen_tguid_list()
+            if not prev_tguid:
+                if self.tguid_list:
+                    return self.tguid_list[0]
+                else:
+                    return ""
+            pos = self.tguid_list.index(prev_tguid)
+            try:
+                return self.tguid_list[pos+1]
+            except:
+                return ""
+
+# return a map of {'<board_name>': board_instance }
+def get_fuego_boards(conf):
+    # scan board directory, and find the board names
+    # FIXTHIS: use glob
+    bfile_list = os.listdir(conf.FUEGO_RO + '/boards')
+    bmap = {}
+
+    for filename in bfile_list:
+        if filename.endswith(".board"):
+            board_path = conf.FUEGO_RO + '/boards/' + filename
+            name = filename[:-6]
+            board = board_class(name, board_path, None, None)
+            board.var_path = conf.FUEGO_RW + '/boards/' + name + ".vars"
+            bmap[name] = board
+
+    return bmap
+
+def dequote(str):
+    if str.startswith('"') and str.endswith('"'):
+        return str[1:-1]
+    else:
+        return str
+
+# process single-line VAR=VALUE lines
+# as well as function blocks
+# function foo () {
+# }
+# override-func foo() {
+# }
+# override VAR=VALUE
+def parse_shell_file(path, conf):
+    global quite, verbose
+
+    var_map = {}
+    fd = open(path)
+
+    in_block = 0
+    block = ""
+    line_no = 0
+    for line in fd.readlines():
+        #print "%d: %s" % (line_no, line),
+        line_no += 1
+        # check for comments
+        if line.lstrip().startswith("#"):
+            continue
+
+        if in_block:
+            # try to find end of block
+            if line.lstrip().startswith('}'):
+                # I hope this is the function closing brace
+                block += line
+                var_map[name] = block
+                in_block = 0
+                continue
+            else:
+                block += line
+                continue
+
+        # check for empty line
+        if not line.strip():
+            continue
+
+        if line.startswith("function "):
+            parts = line.split()
+            name = parts[1]
+            if name.endswith("()"):
+                name = name[:-2]
+            name = "function_%s" % name
+            block = line
+            in_block = 1
+            continue
+
+        if line.startswith("override-func "):
+            parts = line.split()
+            name = parts[1]
+            if name.endswith("()"):
+                name = name[:-2]
+            name = "override function_%s" % name
+            # convert 'override-func' in line to 'function'
+            block = "function"+line[13:]
+            in_block = 1
+            continue
+
+        # handle 'inherit' lines in board file
+        if line.startswith('inherit'):
+            inh_file = dequote(line[8:].strip())
+            inh_vars = get_superclass(inh_file, conf)
+            if not var_map.has_key("INHERITS"):
+                var_map["INHERITS"] = [ inh_vars ]
+            else:
+                var_map["INHERITS"].append(inh_vars)
+            var_map.update(inh_vars)
+            continue
+
+        # handle 'include' lines in board file
+        if line.startswith('include'):
+            inc_file = dequote(line[8:].strip())
+            inc_vars = get_includes(inc_file, conf)
+            if not var_map.has_key("INCLUDES"):
+                var_map["INCLUDES"] = [ inc_vars ]
+            else:
+                var_map["INCLUDES"].append(inc_vars)
+            continue
+
+        if line.find("=")==-1:
+            print_error("Syntax error in file %s: Expected '=' at line %d\n%s" % (path, line_no, line))
+            continue
+
+        (name, value) = line.split('=',1)
+        value = value.strip()
+        name = name.strip()
+        var_map[name] = value
+
+    fd.close()
+
+    return var_map
+
+
+def get_board_vars(board, conf):
+    global quiet, verbose
+
+    board_name = board.name
+    board_path = board.board_path
+    var_path = board.var_path
+
+    # parse the variables out of the board file, and put them into
+    # a python map, that we return
+    bvars = {}
+    bvars["board"] = board_name
+    bvars["board_path"] = board_path
+    bvars["var_path"] = var_path
+
+    var_map = parse_shell_file(board_path, conf)
+    bvars.update(var_map)
+
+    # process inherited and included variables
+
+    # inherited variables are assigned during parsing
+    # and can be overridden by regular and override statements
+    if var_map.has_key("INHERITS"):
+        #inh_list = var_map["INHERITS"]
+        #for inh_map in inh_list:
+        #   tvars.update(inh_map)
+        bvars.pop("INHERITS", None)
+
+    # process overrides
+    keylist = bvars.keys()
+    for key in keylist:
+        if key.startswith("override "):
+            value = bvars[key]
+            name = key[9:]
+            if not bvars.has_key(name):
+                print("Warning: Missing base value to override for '%s'" % name)
+            bvars[name] = value
+            bvars.pop(key, None)
+
+    # included variables are NOT assigned during parsing
+    # they must be assigned here
+    # they can NOT be overridden
+    if var_map.has_key("INCLUDES"):
+        inc_list = var_map["INCLUDES"]
+        for inc_map in inc_list:
+            bvars.update(inc_map)
+        bvars.pop("INCLUDES", None)
+
+    # now get dynamic variables, from the var_path (<board>.vars)
+    if os.path.isfile(var_path):
+        var_map = parse_shell_file(var_path, conf)
+
+        # we do not process inherit statements for the vars file
+        # it's just a stub
+        if var_map.has_key("INHERITS"):
+            var_map.pop("INHERITS", None)
+
+        bvars.update(var_map)
+
+    bvars.pop("OF.NAME", None)
+    bvars.pop("OF.DESCRIPTION", None)
+
+    return bvars
+
+def get_superclass(class_filename, conf):
+    class_path = "%s/engine/overlays/base/%s.fuegoclass" % \
+        (conf.FUEGO_CORE, class_filename)
+
+    sc_vars = parse_shell_file(class_path, conf)
+    return sc_vars
+
+def get_includes(include_filename, conf):
+    inc_path = "%s/engine/overlays/base/%s.fuegoclass" % \
+        (conf.FUEGO_CORE, include_filename)
+
+    inc_vars = parse_shell_file(inc_path, conf)
+    return inc_vars
+
+# link_key() allows us to enforce a preferred order on links in
+# the job description, when they are provided by an
+# end user via a spec file
+# keys (link cover texts) not in the preferred list are sorted
+# after these, in alphabetical order
+preferred_link_order = ["testlog", "run.json", "xlsx", "fuegolog", "devlog", "prolog.sh"]
+def link_key(item):
+    key = item[0]
+    if key in preferred_link_order:
+        return preferred_link_order.index(key)
+    else:
+        return "zzz+"+key
+
+def create_job(board, test):
+    flot_link = '<flotile.FlotPublisher plugin="flot@1.0-SNAPSHOT"/>'
+
+    # prepare links for the descriptionsetter plugin
+    test_spec_path = '/fuego-core/engine/tests/%s/spec.json' % (test.name)
+    template_link = '&lt;a href=&quot;/fuego/userContent/fuego.logs/%s/%s.%s.${BUILD_NUMBER}.${BUILD_ID}/%%s&quot;&gt;%%s&lt;/a&gt;' % (test.name, board, test.spec)
+    test_specs_json = None
+    try:
+        f = open(test_spec_path, "r")
+    except:
+        print("WARNING: opening spec file %s failed.\n  Generating stub spec for test." % test_spec_path)
+        test_specs_json = { "testName": test.name, "specs": { "default": {} } }
+
+    if not test_specs_json:
+        try:
+            test_specs_json = json.load(f)
+        except:
+            error_out("Invalid data in spec file %s" % test_spec_path)
+
+    try:
+        test_spec_json = test_specs_json['specs'][test.spec]
+    except:
+        error_out("Spec '%s' not found for this test (in file %s)" % (test.spec, test_spec_path))
+
+    # prepare the links for the test description
+    # (need link strings for both success and failure)
+
+    # note that the spec file can optionally provide "success_links",
+    # "extra_success_links", "fail_links", or "extra_fail_links".
+    # which are dictionaries indicating a cover text and a file reference.
+    # the file_ref refers to a file inside the log directory for a
+    # run of the test.
+    success_links = ''
+    if 'success_links' in test_spec_json:
+        link_tuples = test_spec_json['success_links'].items()
+        link_tuples.sort(key=link_key)
+    else:
+        # default success links
+        link_tuples = [("testlog", "testlog.txt"), ("run.json", "run.json")]
+
+    for cover, file_ref in sorted(link_tuples, key=link_key):
+        success_links += ' ' + template_link % (str(file_ref), str(cover))
+
+    if 'extra_success_links' in test_spec_json:
+        link_tuples = test_spec_json['extra_success_links'].items()
+        link_tuples.sort(key=link_key)
+        for cover, file_ref in link_tuples:
+            success_links += ' ' + template_link % (str(file_ref), str(cover))
+
+    fail_links = ''
+    if 'fail_links' in test_spec_json:
+        link_tuples = test_spec_json['fail_links'].items()
+        link_tuples.sort(key=link_key)
+    else:
+        # default fail links
+        link_tuples = [("testlog", "testlog.txt"), ("run.json", "run.json"),
+                ("fuegolog","consolelog.txt"), ("devlog", "devlog.txt"),
+                ("prolog.sh", "prolog.sh")]
+    for cover, file_ref in link_tuples:
+        fail_links += ' ' + template_link % (str(file_ref), str(cover))
+
+    if 'extra_fail_links' in test_spec_json:
+        link_tuples = test_spec_json['extra_fail_links'].items()
+        link_tuples.sort(key=link_key)
+        for cover, file_ref in link_tuples:
+            fail_links += ' ' + template_link % (str(file_ref), str(cover))
+
+    tmp = "/tmp/fuego_tmp_job"
+    fd = open(tmp, "w+")
+    fd.write("""<?xml version='1.0' encoding='UTF-8'?>
+<project>
+    <actions/>
+    <description></description>
+    <keepDependencies>false</keepDependencies>
+    <properties/>
+    <scm class="hudson.scm.NullSCM"/>
+    <assignedNode>{board}</assignedNode>
+    <canRoam>false</canRoam>
+    <disabled>false</disabled>
+    <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+    <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+    <triggers/>
+    <concurrentBuild>false</concurrentBuild>
+    <customWorkspace>$FUEGO_RW/buildzone</customWorkspace>
+    <builders>
+    <hudson.tasks.Shell>
+        <command>export Reboot={reboot}
+export Rebuild={rebuild}
+export Target_PreCleanup={precleanup}
+export Target_PostCleanup={postcleanup}
+export TESTDIR={testdir}
+export TESTSPEC={testspec}
+#export FUEGO_DEBUG=1
+timeout --signal=9 {timeout} /bin/bash $FUEGO_CORE/engine/scripts/main.sh
+</command>
+    </hudson.tasks.Shell>
+    </builders>
+    <publishers>
+    {flot_link}
+    <hudson.plugins.descriptionsetter.DescriptionSetterPublisher plugin="description-setter@1.10">
+      <regexp></regexp>
+      <regexpForFailed></regexpForFailed>
+      <description>{success_links}</description>
+      <descriptionForFailed>{fail_links}</descriptionForFailed>
+      <setForMatrix>false</setForMatrix>
+    </hudson.plugins.descriptionsetter.DescriptionSetterPublisher>
+    </publishers>
+    <buildWrappers/>
+</project>
+""".format(board=board, reboot=test.reboot, rebuild=test.rebuild,
+        precleanup=test.precleanup, postcleanup=test.postcleanup,
+        testdir=test.name, testspec=test.spec, timeout=test.timeout,
+        flot_link=flot_link, success_links=success_links, fail_links=fail_links))
+    fd.close()
+
+    job_name=board+"."+test.spec+"."+test.name
+    print("Creating job " + job_name)
+    try:
+        subprocess.call('java -jar /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar -s http://localhost:8080/fuego create-job ' +
+            job_name + ' < ' + tmp, shell=True)
+        os.unlink(tmp)
+    except Exception as e:
+        print("Job already exists")
+        print(e)
+        sys.exit(1)
+
+def create_batch_job(board, testplan, plan_tests):
+    tmp = "/tmp/fuego_tmp_batch"
+    job_list = [board+'.'+test.spec+'.'+test.name for test in plan_tests]
+
+    fd = open(tmp, "w+")
+    fd.write("""<?xml version='1.0' encoding='UTF-8'?>
+<project>
+  <actions/>
+  <description></description>
+  <keepDependencies>false</keepDependencies>
+  <properties/>
+  <scm class="hudson.scm.NullSCM"/>
+  <assignedNode>{board}</assignedNode>
+  <canRoam>false</canRoam>
+  <disabled>false</disabled>
+  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+  <triggers/>
+  <concurrentBuild>false</concurrentBuild>
+  <builders/>
+  <publishers>
+    <hudson.tasks.BuildTrigger>
+      <childProjects>{alljobs}</childProjects>
+      <threshold>
+        <name>SUCCESS</name>
+        <ordinal>0</ordinal>
+        <color>BLUE</color>
+        <completeBuild>true</completeBuild>
+      </threshold>
+    </hudson.tasks.BuildTrigger>
+  </publishers>
+  <buildWrappers/>
+</project>
+""".format(board=board, alljobs=','.join(job_list)))
+
+    fd.close()
+
+    print("Creating batch job ")
+    try:
+        job_name = board+'.'+testplan+'.batch'
+        subprocess.call('java -jar /var/cache/jenkins/war/WEB-INF/jenkins-cli.jar -s http://localhost:8080/fuego create-job ' +
+             job_name + '< ' + tmp, shell=True)
+        os.unlink(tmp)
+    except Exception as e:
+        print("Job already exists")
+        print(e)
+        sys.exit(1)
+
+# returns a list of plantest_class instances
+def parse_testplan(testplan, defaults):
+    abspath = '/fuego-core/engine/overlays/testplans/' + testplan + '.json'
+
+    plan_tests = []
+    with open(abspath, "r") as f:
+        plan = json.load(f)
+
+    if 'default_timeout' in plan:
+        defaults['timeout'] = plan['default_timeout']
+
+    if 'default_spec' in plan:
+        defaults['spec'] = plan['default_spec']
+
+    if 'default_reboot' in plan:
+        defaults['reboot'] = plan['default_reboot']
+
+    if 'default_rebuild' in plan:
+        defaults['rebuild'] = plan['default_rebuild']
+
+    if 'default_precleanup' in plan:
+        defaults['precleanup'] = plan['default_precleanup']
+
+    if 'default_postcleanup' in plan:
+        defaults['postcleanup'] = plan['default_postcleanup']
+
+
+    for test_dict in plan['tests']:
+        # test_dict is a dictionary with values for the test
+        test = plantest_class(test_dict, defaults)
+        plan_tests.append(test)
+
+    return plan_tests
+
+def do_add_jobs(conf, options):
+    if '-b' in options:
+        try:
+            board = options[options.index('-b') + 1]
+        except IndexError:
+            error_out("Board not provided after -b.")
+        options.remove('-b')
+        options.remove(board)
+
+        boards = board.split(",")
+        board_list = get_fuego_boards(conf).keys()
+        for board in boards:
+            if board not in board_list:
+                raise Exception("Board '%s' not found." % board)
+    else:
+        raise Exception("No board name supplied.")
+
+    rebuild=''
+    if '--rebuild' in options:
+        try:
+            rebuild = options[options.index('--rebuild') + 1]
+        except IndexError:
+            error_out('Rebuild option not provided after --rebuild')
+        if rebuild not in ['true','false']:
+            error_out("Invalid rebuild option '%s'" % rebuild)
+
+    timeout = '30m'
+    if '-p' in options:
+        try:
+            testplan = options[options.index('-p') + 1]
+        except IndexError:
+            error_out('Testplan not provided after -p.')
+        plan_list = get_plans(conf).keys()
+        if testplan not in plan_list:
+            raise Exception('Testplan %s not found.' % testplan)
+        options.remove('-p')
+        options.remove(testplan)
+        test_name = None
+    elif '-t' in options:
+        # FIXTHIS: have add-jobs support wildcards in the test name
+        try:
+            test_name = options[options.index('-t') + 1]
+        except IndexError:
+            error_out('Testcase not provided after -t.')
+        test_list = get_tests(conf).keys()
+        if test_name not in test_list:
+            raise Exception('Test %s not found.' % test_name)
+        options.remove('-t')
+        options.remove(test_name)
+        if '-s' in options:
+            try:
+                spec = options[options.index('-s') + 1]
+            except IndexError:
+                error_out('Testspec not provided after -s.')
+            specnames = get_specs(conf, test_name)
+            if spec not in specnames:
+                error_out('Unknown spec %s' % spec)
+            options.remove('-s')
+            options.remove(spec)
+        else:
+            spec = 'default'
+        if '-k' in options:
+            try:
+                timeout = options[options.index('-k') + 1]
+                options.remove('-k')
+            except IndexError:
+                error_out('No timeout specified after -k')
+
+    else:
+        error_out('No testplan or testcase supplied.')
+
+    defaults = {
+        'timeout' : '30m',
+        'spec'    : 'default',
+        'reboot'  : 'false',
+        'rebuild' : 'false',
+        'precleanup'  : 'true',
+        'postcleanup' : 'true'
+    }
+
+    if test_name:
+        # FIXTHIS - we could parse more parameters for the job here, from the ftc command line
+        # use all defaults, except for the spec
+        tp_dict = {"testName":test_name, "timeout":timeout, "spec":spec }
+        if rebuild:
+            tp_dict["rebuild"] = rebuild
+        test = plantest_class(tp_dict, defaults)
+        for board in boards:
+            create_job(board, test)
+    else:
+        plan_tests = parse_testplan(testplan, defaults)
+        for board in boards:
+            for test in plan_tests:
+                if rebuild:
+                    test.rebuild = rebuild
+                create_job(board, test)
+            create_batch_job(board, testplan, plan_tests)
+    sys.exit(0)
+
+def do_build_jobs(conf, options):
+    count = 0
+    if len(options) == 0:
+        error_out('No jobs specified.')
+    else:
+        for opt in options:
+            jobs = [job['name'] for job in server.get_jobs()]
+            pattern = '^' + opt
+            pattern = pattern.replace('.', '\.')
+            pattern = pattern.replace('*', '\w*')
+            pattern = pattern + '$'
+            regex = re.compile(pattern)
+            matches = [string for string in jobs if re.match(regex, string)]
+            if len(matches) == 0:
+                raise Exception('No jobs matched %s.' % opt)
+            else:
+                for match in matches:
+                    if not quiet:
+                        print "Starting build of job %s" % match
+                    server.build_job(match)
+                    count = count + 1
+    if not quiet:
+        print "Started builds for %d jobs." % count
+    sys.exit(0)
+
+def do_rm_jobs(conf, options):
+    count = 0
+
+    if '--remove-logs' in options:
+        remove_logs = True
+        options.remove('--remove-logs')
+    else:
+        remove_logs = False
+
+    if len(options) == 0:
+        confirm = raw_input("Really remove ALL jobs? (y/n) ")
+        if not confirm[0] in "Yy":
+            sys.exit(1)
+        if remove_logs:
+            # remove files and folders in LOGDIR
+            path = conf.FUEGO_RW + "/logs/*"
+            files = glob.glob(path)
+            for f in files:
+                if os.path.isfile(f):
+                    os.remove(f)
+                else:
+                    shutil.rmtree(f, ignore_errors=True)
+        # remove jenkins jobs
+        jobs = [job['name'] for job in server.get_jobs()]
+        for job in jobs:
+            server.delete_job(job)
+            count = count + 1
+    else:
+        for opt in options:
+            jobs = [job['name'] for job in server.get_jobs()]
+            pattern = '^' + opt
+            pattern = pattern.replace('.', '\.')
+            pattern = pattern.replace('*', '\w*')
+            pattern = pattern + '$'
+            regex = re.compile(pattern)
+            matches = [string for string in jobs if re.match(regex, string)]
+            if len(matches) == 0:
+                raise Exception('No jobs matched %s.' % opt)
+            else:
+                for match in matches:
+                    server.delete_job(match)
+                    if remove_logs:
+                        # remove the per-build_number log directories for the job
+                        TESTDIR = '.'.join(match.split('.')[2:])
+                        test_logdir = conf.FUEGO_RW + '/logs/' + TESTDIR
+                        build_dirs = glob.glob(test_logdir + '/' + '.'.join(match.split('.')[:2]) + '*')
+                        for d in build_dirs:
+                            if not os.path.isdir(d):
+                                continue
+                            print 'Removing folder ' + d
+                            shutil.rmtree(d)
+                        # check if the test log directory became empty
+                        remaining_build_dirs = glob.glob(test_logdir + '/*')
+                        build_dirs = [d for d in remaining_build_dirs if os.path.isdir(d)]
+                        if not build_dirs:
+                            print 'Removing test logdir: ' + test_logdir
+                            shutil.rmtree(test_logdir, ignore_errors=True)
+                        else:
+                            print 'updating results.json'
+                            sys.path.insert(0, conf.FUEGO_CORE + '/engine/scripts/parser')
+                            from fuego_parser_results import update_results_json
+                            REF_JSON = '%s/engine/tests/%s/reference.json' % (conf.FUEGO_CORE, TESTDIR)
+                            update_results_json(test_logdir, TESTDIR, REF_JSON)
+                    count = count + 1
+    if not quiet:
+        print "Deleted %d jobs." % count
+    sys.exit(0)
+
+def do_add_nodes(conf, options):
+    global server
+
+    if '-f' in options:
+        force = True
+        options.remove('-f')
+    else:
+        force = False
+
+    board_list = get_fuego_boards(conf).keys()
+    for board in options:
+        if board not in board_list:
+            raise Exception('No %s.board found.' % board)
+
+    params = { 'command' : 'java -jar /fuego-core/engine/slave.jar'}
+    for board in options:
+        nodes = [node['name'] for node in server.get_nodes()]
+        if board in nodes:
+            if force:
+                server.delete_node(board)
+            else:
+                raise Exception('Node \'%s\' already exists' % board)
+
+        server.create_node(
+            board,
+            numExecutors = 1,
+            launcher = jenkins.LAUNCHER_COMMAND,
+            launcher_params = params
+        )
+        # bug?: it seems enable_node requires two calls
+        server.enable_node(board)
+        server.enable_node(board)
+    sys.exit(0)
+
+def do_rm_nodes(conf, options):
+    global server
+
+    nodes = [node['name'] for node in server.get_nodes()]
+    if not options:
+        # FIXTHIS: add warning or ask for -f
+        options = nodes
+    else:
+        for board in options:
+            if board not in nodes:
+                raise Exception('Node \'%s\' not found.' % board)
+
+    for board in options:
+        nodes = [node['name'] for node in server.get_nodes()]
+        if board not in nodes:
+            # in case the same node is repeated in options
+            continue
+        if board == 'master':
+            # the master node is special in jenkins
+            continue
+        server.delete_node(board)
+    sys.exit(0)
+
+def do_add_view(conf, options):
+    global server
+
+    # use these lines to discover the XML for views
+    # if view "test_view" exists, show its xml
+    #if server.view_exists("test_view"):
+    #    view_config_xml = server.get_view_config("test_view")
+    #    print "test_view config xml='%s'" % view_config_xml
+
+    # FIXTHIS - not enough error handling (parameter checking) in do_add_view
+    view_name = options[0]
+    try:
+        job_spec = options[1]
+    except:
+        job_spec = ".*"+view_name+".*"
+
+    views = [view["name"] for view in server.get_views()]
+    if view_name in views:
+        raise Exception("View %s already exists." % view_name)
+
+    if job_spec.startswith("="):
+        job_names = job_spec[1:].split(",")
+        job_name_str = ""
+        for job_name in job_names:
+            # FIXTHIS - validate that job_name is valid in do_add_view
+            job_name_str += "    <string>%s</string>\n" % job_name.strip()
+        include_regex=""
+    else:
+        job_name_str = ""
+        include_regex = "  <includeRegex>%s</includeRegex>\n" % job_spec
+
+    view_config_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hudson.model.ListView>
+  <name>%s</name>
+  <filterExecutors>false</filterExecutors>
+  <filterQueue>false</filterQueue>
+  <properties class="hudson.model.View$PropertyList"/>
+  <jobNames>
+    <comparator class="hudson.util.CaseInsensitiveComparator"/>
+%s  </jobNames>
+  <jobFilters/>
+  <columns>
+    <hudson.views.StatusColumn/>
+    <hudson.views.WeatherColumn/>
+    <hudson.views.JobColumn/>
+    <hudson.views.LastSuccessColumn/>
+    <hudson.views.LastFailureColumn/>
+    <hudson.views.LastDurationColumn/>
+    <hudson.views.BuildButtonColumn/>
+  </columns>
+%s  <recurse>false</recurse>
+</hudson.model.ListView>""" % (view_name, job_name_str, include_regex)
+
+    #print "new view config xml='%s'" % view_config_xml
+    result = server.create_view(view_name, view_config_xml)
+    sys.exit(0)
+
+# shows a list title, if not quiet, and
+# returns an indent to use for the list
+def show_list_title(title):
+    global quiet
+
+    if not quiet:
+        print title
+        indent = "   "
+    else:
+        # machine-readable (-q) output omits the title and indent
+        indent = ""
+    return indent
+
+def do_list_nodes(conf):
+    node_list = [node['name'] for node in server.get_nodes()]
+    node_list.sort()
+
+    indent = show_list_title("Jenkins nodes in this system:")
+    for node in node_list:
+        if node == 'master':
+            continue
+        print indent + node
+
+    sys.exit(0)
+
+def do_list_jobs(conf):
+    job_list = [job['name'] for job in server.get_jobs()]
+    job_list.sort()
+
+    indent = show_list_title("Jenkins jobs in this system:")
+    for job in job_list:
+        print indent + job
+
+    sys.exit(0)
+
+def do_list_boards(conf):
+    board_list = get_fuego_boards(conf).keys()
+    board_list.sort()
+
+    indent = show_list_title("Boards in this system:")
+    for board in board_list:
+        print indent + board
+    sys.exit(0)
+
+# returns a map of {"<plan_name>": "<plan_path>"}
+def get_plans(conf):
+    # scan plan directory, and find the testplan names
+    tpfile_list = os.listdir(conf.FUEGO_CORE + '/engine/overlays/testplans/')
+    #pvar("tpfile_list")
+    pmap = {}
+    for filename in tpfile_list:
+        if filename.endswith(".json"):
+            plan_path = conf.FUEGO_CORE + '/engine/overlays/testplans/' + filename
+            pmap[filename[:-5]] = plan_path
+    pmap["testplan_default"] = conf.FUEGO_CORE + '/engine/overlays/testplans/testplan_default.json'
+    return pmap
+
+def do_list_plans(conf):
+    plan_list = get_plans(conf).keys()
+    plan_list.sort()
+
+    indent = show_list_title("Testplans in this system:")
+    for plan in plan_list:
+        print indent + plan
+    sys.exit(0)
+
+def do_list_specs(conf, options):
+    if '-t' in options:
+        try:
+            testcase = options[options.index('-t') + 1]
+        except IndexError:
+            error_out('Testcase not provided after -t.')
+        test_list = get_tests(conf).keys()
+        if testcase not in test_list:
+            error_out('Testcase %s not found.' % testcase)
+        options.remove('-t')
+        options.remove(testcase)
+    else:
+        error_out('No testcase name supplied.')
+
+    specnames = get_specs(conf, testcase).keys()
+    specnames.sort()
+
+    indent = show_list_title("Testspecs for %s:" % testcase)
+    for spec in specnames:
+        print indent + spec
+    sys.exit(0)
+
+# returns an array of specs where each spec is a dictionary including the name key
+def get_specs(conf, testcase):
+    specpath = '%s/engine/tests/%s/spec.json' % (conf.FUEGO_CORE, testcase)
+    specs = []
+    with open(specpath) as f:
+        try:
+            jd = json.load(f)
+        except:
+            error_out("Error parsing spec file %s" % specpath)
+        return jd["specs"]
+
+# returns a map of {"<test_name>": "<test_dir>"}
+def get_tests(conf):
+    # scan test directory, and find the test names
+    tdir_list = os.listdir(conf.FUEGO_CORE + '/engine/tests')
+
+    test_map = {}
+
+    # only return tests that start with these words
+    test_prefixes = ['Functional','Benchmark']
+
+    for dirname in tdir_list:
+        for test_prefix in test_prefixes:
+            if dirname.startswith(test_prefix):
+                dpath = conf.FUEGO_CORE + '/engine/tests/' + dirname
+                if os.path.isdir(dpath):
+                    test_map[dirname] = dpath
+
+    return test_map
+
+def do_list_tests(conf):
+    global quiet, verbose
+
+    test_list = get_tests(conf).keys()
+    test_list.sort()
+
+    indent = show_list_title("Available tests in this system:")
+    for test in test_list:
+        print indent + test
+    sys.exit(0)
+
+# returns a map of {"<run_name>": run_object}
+def get_runs(conf):
+    # scan logs directory, and find the run directories
+    # build directories are under /var/lib/jenkins/jobs/<job_name>/builds
+    # a build dir has: build.xml, changelog.xml, log (which is the console log)
+
+    # logs were at /fuego-rw/logs/<test_name>/<board>.<timestamp>.<build_num>.<build_num>
+    # logs are now at /fuego-rw/logs/<test_name>/<board>.<spec>.<build_num>.<build_num>
+    run_map = {}
+    log_path = conf.FUEGO_RW + "/logs"
+    tdir_list = os.listdir(log_path)
+    #pvar("tdir_list")
+    for test_name in tdir_list:
+        tpath = log_path + os.sep + test_name
+        if not os.path.isdir(tpath):
+            continue
+        rundir_list = os.listdir(tpath)
+        for run_item in rundir_list:
+            rundir = tpath + os.sep + run_item
+            if not os.path.isdir(rundir):
+                continue
+            # skip symlinks
+            if os.path.islink(rundir):
+                continue
+            try:
+                board, spec, num, junk = run_item.split(".",3)
+            except:
+                # ignore non-standard-named dirs
+                continue
+            run = run_class(conf, spec, test_name, conf.host,
+                    board, rundir, num)
+            run_map[run.run_id] = run
+    return run_map
+
+class where_class:
+    def __init__(self, field_name, op, value):
+        self.field_name = field_name
+
+        # 'test' fieldname is special, because it can match either
+        # the full test name (including the Benchmark or Functional prefix)
+        # or just the base test name without the prefix.
+        # Check for a full testname here
+        if self.field_name=="test" and \
+                (value.startswith("Benchmark.") or
+                value.startswith("Functional.")):
+            self.field_name="test_name"
+
+        self.op = op
+
+        if field_name=="start_time":
+            # convert value to seconds since epoch
+            # this allows things like: "start_time>yesterday"
+            import parsedatetime as pdt
+            import datetime
+            import time
+            cal = pdt.Calendar()
+            d_tuple = cal.parse(value)
+            dt = datetime.datetime(*d_tuple[0][:7])
+            value = str(time.mktime(dt.timetuple())*1000)
+            print("where start_time value is '%s'" % value)
+
+        self.value = value
+
+    def __repr__(self):
+       return "where(%s, %s, %s)" % (self.field_name, self.op, self.value)
+
+    def match(self, run):
+        # some fields can be found without loading the run.json file
+        # examples are: "test", "type", "spec", "board", "num"
+        found = False
+        try:
+            run_value = run.__dict__[self.field_name]
+            found = True
+        except:
+            pass
+
+        #if not found:
+        #    print("Warning: did not find field '%s' in run %s" % \
+        #        (self.field_name, run.run_id))
+
+        if not found or run_value=="<data not loaded>":
+            run.get_run_data_from_json_file()
+            try:
+                run_value = run.__dict__[self.field_name]
+            except:
+                print("Error: did not find field '%s' in loaded run data for run %s" % (self.field_name, run.run_id))
+                return False
+
+        if self.op=="=":
+            return run_value == self.value
+        elif self.op=="!=":
+            return run_value != self.value
+        elif self.op=="=~":
+            return re.match(self.value, run_value)
+        elif self.op=="<=":
+            return float(run_value) <= float(self.value)
+        elif self.op==">=":
+            return float(run_value) >= float(self.value)
+        elif self.op=="<":
+            return float(run_value) < float(self.value)
+        elif self.op==">":
+            return float(run_value) > float(self.value)
+        return False
+
+# returns a where_list (list of where tuples)
+# each where tuple is (field_name, operation, value)
+def parse_where(where_string):
+    # the order of entries in this list is important
+    # use most-specific strings first
+    op_list = ["!=", "=~", "<=", ">=", "=", "<", ">"]
+    #field_list = ["testcase", "test","type","spec","board","host","since"]
+    field_list = ["test","type","spec","board","start_time", "result",
+        "batch_id", "status", "build_number"]
+    where_list = []
+    for clause in where_string.split(","):
+        where = None
+        for op in op_list:
+            if op in clause:
+                field_name, value=clause.split(op,1)
+                if field_name not in field_list:
+                    error_out("Invalid field '%s' in where condition" % field_name)
+                where = where_class(field_name, op, value)
+                break
+        if where:
+            where_list.append(where)
+        else:
+            print("Error: unknown where condition %s" % where)
+
+    return where_list
+
+def filter_runs(run_map, where_list):
+    new_run_list = []
+    for run_id, run in run_map.items():
+        match = True
+        for where in where_list:
+            if not where.match(run):
+                match = False
+        # add to list if all run matches all conditions
+        # FIXTHIS - add support for 'or' to 'where' processing
+        if match:
+            new_run_list.append(run_id)
+    return new_run_list
+
+def do_list_runs(conf, options):
+    global quiet, verbose
+
+    run_map = get_runs(conf)
+
+    if "--where" in options:
+        where_str= options[options.index("--where")+1]
+        where_list = parse_where(where_str)
+        run_list = filter_runs(run_map, where_list)
+    else:
+        run_list = run_map.keys()
+
+    run_list.sort()
+
+    col_format = "  %-27s %-22s %-30s %-6s"
+    dashes = (27*"-", 22*"-", 30*"-", 6*"-")
+    if not quiet:
+        print("Runs on this host:")
+        print(col_format % ("Test", "Started", "host:board", "Status"))
+        print(col_format % dashes)
+
+    for run_id in run_list:
+        if quiet:
+            print("%-20s" % run_id)
+        else:
+            run = run_map[run_id]
+            host_board = "%s:%s" % (run.host, run.board)
+            run.get_run_data_from_json_file()
+            print(col_format % (run.test_name, run.timestamp,
+                host_board, run.status))
+
+    sys.exit(0)
+
+# returns a list of tuples with header fields and value strings
+# for each of the header_fields specified
+# the value strings may have a list or range of values
+# for runs included in the report
+def get_report_header_data(run_list, run_map, header_fields):
+    header_data = []
+
+    for field in header_fields:
+        if field=="report_date":
+            val_str = time.strftime("%Y-%m-%d_%H:%M:%S")
+        else:
+            value_list = []
+            for run_id in run_list:
+                run = run_map[run_id]
+                new_value = run.get_field(field)
+                if new_value not in value_list:
+                    value_list.append(new_value)
+            value_list.sort()
+
+            val_str = str(value_list[0])
+            if field=="timestamp" and len(value_list)>1:
+                val_str += " to "+value_list[-1]
+            else:
+                for value in value_list[1:]:
+                    val_str += ", "+value
+        header_data.append((field,val_str))
+
+    return header_data
+
+# Returns a list of lists.  First list (report_data[0]) is the
+# list of field names.
+# In each subsequent list is a list of values corresponding to the
+# requested fields, from the run data
+def get_report_data(run_list, run_map, fields):
+    # first element is list of field names
+    report_data = [fields]
+
+    # now loop over the runs, printing the requested report fields
+    # if tguid is a field, we'll print a line for each tguid
+    # otherwise, it's a line per test
+    run_index = 0
+    run_id = run_list[run_index]
+    run = run_map[run_id]
+    run.get_run_data_from_json_file()
+    cur_tguid = ""
+
+    done = False
+    while not done:
+        cur_tguid = run.next_tguid(cur_tguid)
+        # skip 'default' test set names
+        if cur_tguid=="default":
+            continue
+        if not cur_tguid:
+            # switch to next run
+            run_index += 1
+            if run_index >= len(run_list):
+                done = True
+                break
+            run_id = run_list[run_index]
+            run = run_map[run_id]
+            run.get_run_data_from_json_file()
+            cur_tguid = run.next_tguid("")
+            # skip 'default' test set names
+            if cur_tguid=="default":
+                continue
+
+        # at this point, we have a (run, tguid) with data
+
+        # get the values of the fields for this entry
+        value_list = []
+        for field in fields:
+            if field=="tguid":
+                value_list.append(cur_tguid)
+            else:
+                if field.startswith("tguid:"):
+                    tguid_name = cur_tguid
+                    field = field[6:]
+                else:
+                    tguid_name = ""
+                value_list.append(run.get_field(field, tguid_name))
+
+        report_data.append(value_list)
+    return report_data
+
+def gen_text_report(header_data, report_data):
+    # generate header
+    ddash_line="="*70 + "\n"
+    report = ddash_line
+    title = "Fuego Test Report"
+    report += "           **** %s ****\n" % title
+    report_date = time.strftime("%Y-%m-%d_%H:%M:%S")
+
+    for field,val_str in header_data:
+        report += "  %-20s: %s\n" % (field, val_str)
+    report += ddash_line
+
+    # generate lines for this report
+    fields = report_data[0]
+    row_start = "  "
+    row_end = "\n"
+
+    # set default col_width to 20
+    col_widths = []
+    for field in fields:
+        col_widths.append(20)
+
+    # find longest string in each column
+    for vlist in report_data:
+        col = 0
+        for v in vlist:
+            if len(str(v)) > col_widths[col]:
+                col_widths[col] = len(v)
+            col += 1
+
+    # FIXTHIS - use col_widths instead of just hardcoding 20 in gen_report
+
+    # start with a header line
+    dash_line = "-"*(21*len(fields)+2) + "\n"
+    report += dash_line
+    report += row_start
+    for field in fields:
+        report += "%-20s " % field
+    report += row_end
+
+    report += dash_line
+
+    # format values into columns in each row
+    for values in report_data[1:]:
+        report += row_start
+        for value in values:
+            report += "%-20s " % value
+        report += row_end
+
+    report += dash_line
+
+    return report
+
+def gen_html_report(header_data, report_data):
+    # generate header
+    title = "Fuego Test Report"
+    report_date = time.strftime("%Y-%m-%d_%H:%M:%S")
+
+    report = """<table border="1">
+        <tr><td colspan="2" align="center"><h2>%(title)s</h2></td></tr>
+        <tr><td colspan="2" align="center">Report Date: %(report_date)s</td></tr>
+        <tr>\n""" % locals()
+    for field,val_str in header_data:
+        report += "<tr><td>%s</td><td>%s</td><tr>\n" % (field, val_str)
+    report += "</table>"
+
+    # generate lines for this report
+    fields = report_data[0]
+
+    # start table with a header row
+    report += '<table border="1">\n'
+    report += '<tr><th>'
+    pos = 0
+    for field in fields:
+        report += "%s" % field
+        if pos < len(fields)-1:
+            report += '</th><th>'
+        pos += 1
+    report += '</th></tr>\n'
+
+    # format values into columns in each row
+    for values in report_data[1:]:
+        report += '<tr><td>'
+        pos = 0
+        for value in values:
+            report += "%s" % value
+            if pos < len(values)-1:
+                report += '</td><td>'
+            pos += 1
+        report += '</td></tr>\n'
+    report += '</table>\n'
+
+    return report
+
+# add page number for pdf file
+def add_page_number(canvas, doc):
+    from reportlab.lib.units import mm
+
+    page_num = canvas.getPageNumber()
+    text = "Page %s" % page_num
+    canvas.drawRightString(200*mm, 20*mm, text)
+
+def gen_pdf_report(header_data, report_data, report_dir):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+
+    # create a pdf file
+    doc = SimpleDocTemplate(report_dir + "report.pdf", pagesize=A4)
+    elements = []
+
+    # generate header
+    styles = getSampleStyleSheet()
+    elements.append(Paragraph("Fuego Test Report\n", styles["Heading1"]))
+    for field,val_str in header_data:
+        elements.append(Paragraph("%s: %s\n" % (field, val_str), styles["Normal"]))
+
+    # generate lines for this report
+    fields = report_data[0]
+
+    # create the table with a header row in each page
+    report_data = [[Paragraph(str(cell), styles["Normal"]) for cell in row] for row in report_data]
+    table = Table(report_data, repeatRows=1, colWidths=[75,75])
+
+    # format for table in the report file
+    table.setStyle(TableStyle([("INNERGRID", (0, 0), (-1, -1), 0.25, colors.black),
+                               ("BOX", (0, 0), (-1, -1), 0.25, colors.black),
+                               ("BACKGROUND",(0, 0), (len(fields) - 1,0), colors.silver),
+                               ("VALIGN",(0, 0), (-1, -1), "MIDDLE")]))
+
+    elements.append(table)
+    doc.build(elements, onFirstPage=add_page_number, onLaterPages=add_page_number)
+
+# adjust column width size
+def pts_set_style(ws):
+    dims ={}
+    for row in ws.rows:
+        for cell in row:
+            if cell.value:
+                dims[cell.column] = max((dims.get(cell.column, 0), len(str(cell.value)) + 2))
+    for col, value in dims.items():
+        ws.column_dimensions[col].width = value
+
+# return number to Excel-style column name
+def excel_column_name(n):
+    name = ""
+    while n > 0:
+        n, r = divmod (n - 1, 26)
+        name = chr(r + ord('A')) + name
+    return name
+
+def gen_excel_report(header_data, report_data, report_dir):
+    from openpyxl import Workbook
+    from openpyxl.style import Fill, Color
+
+    # create an excel file and add worksheets
+    workbook = Workbook()
+    header_sheet = workbook.create_sheet(title="Header")
+    data_sheet = workbook.create_sheet(title="Data")
+
+    # generate header
+    header_sheet.append(["Fuego Test Report"])
+    for field,val_str in header_data:
+        header_sheet.append(["%s: %s" % (field, val_str)])
+    pts_set_style(header_sheet)
+
+    # generate lines for this report
+    for item in report_data:
+        data_sheet.append(item)
+    pts_set_style(data_sheet)
+
+    # format header row to sheet
+    head_fill = Fill()
+    head_fill.start_color = Color('FFC0C0C0')
+    head_fill.end_color = Color('FFC0C0C0')
+    head_fill.fill_type = Fill.FILL_SOLID
+    for j in range(0, data_sheet.get_highest_column()):
+        data_sheet.cell(row = 0, column = j).style.fill = head_fill
+
+    # add auto filter
+    data_sheet.auto_filter = "A1:" + excel_column_name(data_sheet.get_highest_column()) + str(data_sheet.get_highest_row())
+
+    # if we have added sheets, remove the default one ("Sheet")
+    sheets = workbook.get_sheet_names()
+    if len(sheets) > 1:
+        workbook.remove_sheet(workbook.get_sheet_by_name("Sheet"))
+
+    # save the report
+    workbook.save(report_dir + "report.xlsx")
+
+def gen_csv_report(header_data, report_data, report_dir):
+    import csv
+
+    filename = report_dir + "report.csv"
+    # generate header
+    with open(filename, "wb") as report:
+        writer = csv.writer(report)
+        report.write("Fuego Test Report\n")
+        writer.writerows(header_data)
+        report.write("\n")
+
+    # generate lines for this report
+        writer.writerows(report_data)
+
+# generate a report from run results
+def do_gen_report(conf, options):
+    global quiet, verbose
+
+    run_map = get_runs(conf)
+
+    if "--where" in options:
+        where_str= options[options.index("--where")+1]
+        where_list = parse_where(where_str)
+        run_list = filter_runs(run_map, where_list)
+    else:
+        run_list = run_map.keys()
+
+    if not run_list:
+        error_out ('No runs to report, based on requested/filtered runs')
+
+    run_list.sort()
+
+    fmt="txt"
+    if "--format" in options:
+        fmt = options[options.index("--format")+1]
+        if fmt not in ["txt","html","pdf","excel","csv"]:
+            error_out("Unsupported format '%s' specified" % fmt)
+
+    if "--layout" in options:
+        layout = options[options.index("--layout")+1]
+        # FIXTHIS
+        error_out("Layouts not handled yet!")
+
+    else:
+        header_fields = ["test", "board", "kernel", "timestamp",
+            "report_date"]
+        fields = ["test_name", "spec", "board", "timestamp", "tguid", "tguid:result"]
+        #fields = ["test_name", "spec", "board", "timestamp", "tguid", "status"]
+        #rfields = ["test_name", "spec", "board", "timestamp", "tguid", "tguid:measure", "tguid:unit", "tguid:status", "tguid:result"]
+
+        # create a directory to save report files
+        report_dir = "/fuego-rw/report/"
+        if not os.path.exists(report_dir):
+            os.makedirs(report_dir)
+
+    # get data for report
+    header_data = get_report_header_data(run_list, run_map, header_fields)
+    report_data = get_report_data(run_list, run_map, fields)
+
+    if fmt=="txt":
+       report = gen_text_report(header_data, report_data)
+    if fmt=="html":
+        report = gen_html_report(header_data, report_data)
+    if fmt=="pdf":
+        gen_pdf_report(header_data, report_data, report_dir)
+        sys.exit(0)
+    if fmt=="excel":
+        gen_excel_report(header_data, report_data, report_dir)
+        sys.exit(0)
+    if fmt=="csv":
+        gen_csv_report(header_data, report_data, report_dir)
+        sys.exit(0)
+
+    print report
+
+    sys.exit(0)
+
+def get_requests_from_server(conf, options):
+    url = conf.SERVER_URL_BASE+"query_requests"
+    if not options:
+        options.append("host=%s" % conf.host)
+
+    data = {}
+    for criteria in options:
+        if "=" not in criteria:
+            error_out("Unrecognized criteria '%s' specified for query of requests" % criteria)
+        field, value = criteria.split("=",1)
+        if field not in ["host", "board"]:
+            error_out("Request query criteria may only use 'host' or 'board'")
+        data[field] = value
+    resp = requests.post(url, data=data)
+    result, content = resp.text.split('\n',1)
+    if result != "OK":
+        error_out("Can't read requests from server\nServer returned message: %s" % content)
+    req_list = []
+    for req in content.split("\n"):
+        if req:
+            req_list.append(req)
+    return req_list
+
+def do_list_requests(conf, options):
+    req_list= get_requests_from_server(conf, options)
+
+    indent = show_list_title("Requests on the Fuego server:")
+    if req_list:
+        for req in req_list:
+            print indent + req
+    else:
+        if options:
+            extra_msg = " that match the specified criteria"
+        else:
+            extra_msg = ""
+        print("No requests found%s." % extra_msg)
+    sys.exit(0)
+
+# returns dictionary for the request
+def get_request(conf, req_id):
+    url = conf.SERVER_URL_BASE+"get_request"
+    data = { "request_id": req_id }
+    resp = requests.post(url, data=data)
+    result, content = resp.text.split('\n',1)
+    if result != "OK":
+        error_out("Can't read request '%s' from server\nServer returned message: %s" % (req_id, content))
+
+    try:
+        req = json.loads(content)
+    except:
+        error_out("Can't convert json from server for request '%s'\nServer data was: %s" % (req_id, content))
+
+    return req
+
+def do_run_request(conf, options):
+    if not options:
+        req_id = 'next'
+    else:
+        req_id = options[0]
+        del options[0]
+
+    if req_id=="next":
+        req_list= get_requests_from_server(conf, options)
+        if not req_list:
+            if options:
+                extra_msg = " that match the specified criteria"
+            else:
+                extra_msg = ""
+            print("No requests found%s." % extra_msg)
+        req_id = req_list[0]
+
+    print "Trying to get request '%s' from server" % req_id
+    req = get_request(conf, req_id)
+
+    # FIXTHIS - in do_run_request, notify server that request is in-progress
+
+    # now actually execute the request
+    board_name = req["board"]
+    test_name = req["test_name"]
+    testplan = req["testplan"]
+
+    # use fuego boards for now (that's what do_test_run uses)
+    bmap = get_fuego_boards(conf)
+    try:
+        board = bmap[board_name]
+    except:
+        error_out("Request %s has invalid board %s" % (req_id, board_name))
+
+    # FIXTHIS - run_request: should process Reboot, Rebuild and Target_cleanup flags
+    print("Executing test %s on board %s (using %s)" % (test_name, board_name, testplan))
+    do_run_test(conf, ['-b', board_name, '-t', test_name, '-p', testplan])
+
+    # FIXTHIS - in run_request, send results to server
+    sys.exit(0)
+
+# returns next available job number as a string
+# use and increment nextBuildNumber
+def find_next_build_number(job_dir):
+    # calculate the next number from nextBuildNumber
+    filename = job_dir + "/nextBuildNumber"
+    fd = open(filename)
+    data = fd.read()
+    file_build_num = int(data)
+    fd.close()
+    build_number = str(file_build_num)
+    return build_number
+
+# don't use nextBuildNumber, but rather scan a directory
+# and return a number 1 higher than the maximum seen
+# returns a string
+def find_next_build_number_by_log_scan(logs_dir):
+    entries = os.listdir(logs_dir)
+    max_job_num = 0
+    for entry in entries:
+        # get only the num part (after last '.')
+        if "." in entry:
+            junk, entry = entry.rsplit(".", 1)
+
+        try:
+            num = int(entry)
+            if num > max_job_num:
+                max_job_num = num
+        except ValueError:
+            pass
+
+    build_number = str(max_job_num + 1)
+    return build_number
+
+class data_class:
+    def __init__(self):
+        self.data = {}
+
+    def __getitem__(self, key):
+        # return value for key
+        if self.data.has_key(key):
+            item = self.data[key]
+        elif hasattr(self, key):
+            item = getattr(self, key)
+        else:
+            if self.data.has_key("default"):
+                item = self.data["default"]
+            else:
+                item = "missing data value for key '%s'" % key
+
+        if callable(item):
+            return item(self)
+        else:
+            return item
+
+def write_run_build_xml_file(run_dir, build_data):
+    ### the format str needs build_data to have the following attributes:
+    # board_name
+    # reboot_flag, rebuild_flag, target_cleanup_flag
+    #    the flags must be one of (lower case) 'true' or 'false'
+    # testplan_name
+    # build_number
+    # start_time - in milliseconds
+    # description
+    # duration - in milliseconds
+    # result - can be 'FAILURE', 'SUCCESS', or 'ABORTED'
+    # ## keep_log_flag - not set at the moment
+    # workspace
+
+    filename = run_dir + "/build.xml"
+    fd = open(filename, "w+")
+
+    fd.write("""<?xml version='1.0' encoding='UTF-8'?>
+<build>
+  <actions>
+    <jp.ikedam.jenkins.plugins.groovy__label__assignment.GroovyLabelAssignmentAction plugin="groovy-label-assignment@1.0.0">
+      <label class="hudson.model.labels.LabelAtom">qemu-test-arm</label>
+    </jp.ikedam.jenkins.plugins.groovy__label__assignment.GroovyLabelAssignmentAction>
+    <hudson.model.ParametersAction>
+      <parameters>
+        <hudson.model.StringParameterValue>
+          <name>Device</name>
+          <description>(board)</description>
+          <value>%(board_name)s</value>
+        </hudson.model.StringParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Reboot</name>
+          <description>If checked board will be rebooted &lt;u&gt;before&lt;/u&gt; running test.</description>
+          <value>%(reboot_flag)s</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Rebuild</name>
+          <description>If checked all existing build instances of the test suite will be deleted and test suite will be rebuilt from tarball.</description>
+          <value>%(rebuild_flag)s</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Target_Cleanup</name>
+          <description></description>
+          <value>true</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.StringParameterValue>
+          <name>TESTPLAN</name>
+          <description></description>
+          <value>%(testplan_name)s</value>
+        </hudson.model.StringParameterValue>
+      </parameters>
+    </hudson.model.ParametersAction>
+    <hudson.model.CauseAction>
+      <causes>
+        <hudson.model.Cause_-UserIdCause/>
+      </causes>
+    </hudson.model.CauseAction>
+    <hudson.plugins.descriptionsetter.DescriptionSetterAction plugin="description-setter@1.8">
+      <description></description>
+    </hudson.plugins.descriptionsetter.DescriptionSetterAction>
+    <org.jvnet.hudson.plugins.groovypostbuild.GroovyPostbuildAction plugin="groovy-postbuild@1.6-SNAPSHOT">
+      <text>qemu-test-arm / unknown</text>
+      <color>black</color>
+      <background>#FFFFFF</background>
+      <border>0px</border>
+      <borderColor></borderColor>
+    </org.jvnet.hudson.plugins.groovypostbuild.GroovyPostbuildAction>
+    <com.sonyericsson.rebuild.RebuildAction plugin="rebuild@1.9"/>
+  </actions>
+  <number>%(build_number)s</number>
+  <startTime>%(start_time)s</startTime>
+  <result>%(result)s</result>
+  <description>%(description)s</description>
+  <duration>%(duration)s</duration>
+  <charset>US-ASCII</charset>
+  <keepLog>false</keepLog>
+  <builtOn>%(board_name)s</builtOn>
+  <workspace>%(workspace)s</workspace>
+  <hudsonVersion>1.509.2</hudsonVersion>
+  <scm class="hudson.scm.NullChangeLogParser"/>
+  <culprits class="com.google.common.collect.EmptyImmutableSortedSet"/>
+</build>""" % build_data)
+
+    fd.close()
+
+def write_build_xml_file(run_dir, build_data):
+    ### the format str needs build_data to have the following attributes:
+    # board_name
+    # reboot_flag, rebuild_flag, target_cleanup_flag
+    #    the flags must be one of (lower case) 'true' or 'false'
+    # testplan_name
+    # build_number
+    # start_time - in milliseconds
+    # description
+    # duration - in milliseconds
+    # result - can be 'FAILURE', 'SUCCESS', or 'ABORTED'
+    # ## keep_log_flag - not set at the moment
+    # workspace
+
+    filename = run_dir + "/build.xml"
+    fd = open(filename, "w+")
+
+    fd.write("""<?xml version='1.0' encoding='UTF-8'?>
+<build>
+  <actions>
+    <jp.ikedam.jenkins.plugins.groovy__label__assignment.GroovyLabelAssignmentAction plugin="groovy-label-assignment@1.0.0">
+      <label class="hudson.model.labels.LabelAtom">qemu-test-arm</label>
+    </jp.ikedam.jenkins.plugins.groovy__label__assignment.GroovyLabelAssignmentAction>
+    <hudson.model.ParametersAction>
+      <parameters>
+        <hudson.model.StringParameterValue>
+          <name>Device</name>
+          <description>(board)</description>
+          <value>%(board_name)s</value>
+        </hudson.model.StringParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Reboot</name>
+          <description>If checked board will be rebooted &lt;u&gt;before&lt;/u&gt; running test.</description>
+          <value>%(reboot_flag)s</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Rebuild</name>
+          <description>If checked all existing build instances of the test suite will be deleted and test suite will be rebuilt from tarball.</description>
+          <value>%(rebuild_flag)s</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.BooleanParameterValue>
+          <name>Target_Cleanup</name>
+          <description></description>
+          <value>true</value>
+        </hudson.model.BooleanParameterValue>
+        <hudson.model.StringParameterValue>
+          <name>TESTPLAN</name>
+          <description></description>
+          <value>%(testplan_name)s</value>
+        </hudson.model.StringParameterValue>
+      </parameters>
+    </hudson.model.ParametersAction>
+    <hudson.model.CauseAction>
+      <causes>
+        <hudson.model.Cause_-UserIdCause/>
+      </causes>
+    </hudson.model.CauseAction>
+    <hudson.plugins.descriptionsetter.DescriptionSetterAction plugin="description-setter@1.8">
+      <description></description>
+    </hudson.plugins.descriptionsetter.DescriptionSetterAction>
+    <org.jvnet.hudson.plugins.groovypostbuild.GroovyPostbuildAction plugin="groovy-postbuild@1.6-SNAPSHOT">
+      <text>qemu-test-arm / unknown</text>
+      <color>black</color>
+      <background>#FFFFFF</background>
+      <border>0px</border>
+      <borderColor></borderColor>
+    </org.jvnet.hudson.plugins.groovypostbuild.GroovyPostbuildAction>
+    <com.sonyericsson.rebuild.RebuildAction plugin="rebuild@1.9"/>
+  </actions>
+  <number>%(build_number)s</number>
+  <startTime>%(start_time)s</startTime>
+  <result>%(result)s</result>
+  <description>%(description)s</description>
+  <duration>%(duration)s</duration>
+  <charset>US-ASCII</charset>
+  <keepLog>false</keepLog>
+  <builtOn>%(board_name)s</builtOn>
+  <workspace>%(workspace)s</workspace>
+  <hudsonVersion>1.509.2</hudsonVersion>
+  <scm class="hudson.scm.NullChangeLogParser"/>
+  <culprits class="com.google.common.collect.EmptyImmutableSortedSet"/>
+</build>""" % build_data)
+
+    fd.close()
+
+def make_temp_file(data):
+    try:
+        fd = tempfile.NamedTemporaryFile(prefix="ftc-", delete=False)
+        fd.write(data)
+    finally:
+        fd.close()
+
+    return fd.name
+
+# routines for handling sub-process timeouts
+class FTC_INTERRUPT(Exception):
+    pass
+
+def alarm_handler(signum, frame):
+    raise FTC_INTERRUPT
+
+# this function executes the command, and shows the log file
+# while it is running
+def ftc_exec_command(command, timeout):
+    global log, tail_fd
+
+    # fix Python's weird pipe handling, so subprocess command will handle pipe
+    # signals correctly.  Otherwhise, something like 'ftc... | head' will fail
+
+    # well, the following doesn't work
+    #signal.signal(signal.SIGPIPE,signal.SIG_DFL)
+
+    print "ftc_exec_command: command=%s" % command
+
+    p = subprocess.Popen(command.split(), stdout=log, stderr=log)
+
+    # specify timeout for command operation
+    signal.signal(signal.SIGALRM, alarm_handler)
+    signal.alarm(timeout)
+
+    try:
+        # p.poll returns exit code when process completes
+        # and None while it is still running
+        while p.poll() is None:
+            #print "test command is running in the background"
+
+            # output the log while the command is running
+            log.flush()
+            data = os.read(tail_fd, 4096)
+            if data:
+                print data
+
+    except FTC_INTERRUPT:
+        print "Job interrupted!"
+        # abort with prejudice...
+        p.kill()
+    finally:
+        signal.alarm(0)
+
+    return p.returncode
+
+def do_put_request(conf, options):
+    try:
+        opts, args = getopt.gnu_getopt(sys.argv[1:],
+           "Rp:",["reboot", "plan="])
+    except getopt.GetoptError:
+        usage(1, ["put-request"])
+
+    try:
+        board_host = options[0]
+        del options[0]
+    except:
+        print_error("Missing board for operation")
+        usage(1, ["put-request"])
+
+    try:
+        host, board = board_host.split(":",1)
+    except:
+        print_error("Must specify both host and board")
+        usage(1, ["put-request"])
+
+    try:
+        test_name = options[0]
+        del options[0]
+    except:
+        print_error("Missing test for operation")
+        usage(1, ["put-request"])
+
+    plan="testplan_default"
+    if options:
+        plan = options[0]
+        del options[0]
+
+    reboot="False"
+    for o,a in opts:
+        if o in ("-R", "--reboot"):
+            reboot = "True"
+        if o in ("-p", "--plan"):
+            plan = a
+
+    url = conf.SERVER_URL_BASE+"put_request"
+    data = {"test_name":test_name,
+            "host": host,
+            "board": board,
+            "reboot":reboot,
+            "rebuild":"False",
+            "target_cleanup":"False",
+            "testplan":plan,
+            "requestor":"Tim",
+            }
+    resp = requests.post(url, data=data)
+    result, content = resp.text.split('\n',1)
+    if result != "OK":
+        error_out("Can't put request to server\nServer returned message: %s" % content)
+
+    print "Request was accepted by the server."
+    sys.exit(0)
+
+def do_put_test(conf, options):
+    try:
+        test_arg = options[0]
+    except:
+        error_out("Must specify a test name or test file to put")
+        usage(1, ["put-test"])
+
+    # check whether argument is a file or test name
+    if os.path.isfile(test_arg):
+        created_package = False
+        test_filepath = test_arg
+        if not test_filepath.endswith(".ftp"):
+            error_out("Invalid extension for test package.  Was expecting '.ftp'")
+    else:
+        created_package = True
+        test_filepath = do_package_test(conf, [test_arg, "-o", "/tmp"])
+
+    url = conf.SERVER_URL_BASE+"put_test"
+    test_files = {"file1":open(test_filepath, "rb")}
+    resp = requests.post(url, files=test_files)
+    if created_package:
+        os.remove(test_filepath)
+    result, content = resp.text.split('\n',1)
+    if result != "OK":
+        error_out("Can't put test to server\nServer returned message: %s" % content)
+
+    print "Test package %s was accepted by the server." % os.path.basename(test_filepath)
+
+def do_put_run(conf, options):
+    # FIXTHIS - could consolidate do_put_test and do_put_run into do_put_item
+    # do_put_item(conf, options, item_type, ext)
+    try:
+        run_arg = options[0]
+    except:
+        error_out("Must specify a run_id or run file to put")
+        usage(1, ["put-run"])
+
+    # check whether argument is a file or run_id
+    if os.path.isfile(run_arg):
+        created_package = False
+        run_filepath = run_arg
+        if not run_filepath.endswith(".frp"):
+            error_out("Invalid extension for run package.  Was expecting '.frp'")
+    else:
+        created_package = True
+        run_filepath = do_package_run(conf, [run_arg, "-o", "/tmp"])
+
+    url = conf.SERVER_URL_BASE+"put_run"
+    run_files = {"file1":open(run_filepath, "rb")}
+    resp = requests.post(url, files=run_files)
+    if created_package:
+        os.remove(run_filepath)
+    result, content = resp.text.split('\n',1)
+    if result != "OK":
+        error_out("Can't put run to server\nServer returned message: %s" % content)
+
+    print "Run package %s was accepted by the server." % os.path.basename(run_filepath)
+
+def do_run_test(conf, options):
+    global log, tail_fd
+
+    if '-b' in options:
+        try:
+            board_name = options[options.index('-b') + 1]
+        except IndexError:
+            error_out('Board not provided after -b.')
+        boards = get_fuego_boards(conf)
+        if board_name not in boards.keys():
+            error_out('Board %s not found.' % board_name)
+        options.remove(board_name)
+        options.remove('-b')
+        board = boards[board_name]
+    else:
+        error_out("Run-test command requires a board")
+
+    if '-t' in options:
+        # FIXTHIS: have run-test support wildcards in the test name
+        try:
+            test_name = options[options.index('-t') + 1]
+        except IndexError:
+            error_out('Testcase not provided after -t.')
+        test_list = get_tests(conf).keys()
+        if test_name not in test_list:
+            error_out('Test %s not found.' % test_name)
+        options.remove(test_name)
+        options.remove('-t')
+    else:
+        error_out("Run-test command requires a test name")
+
+    if '-s' in options:
+        try:
+            spec_name = options[options.index('-s') + 1]
+        except IndexError:
+            error_out('Testspec not provided after -s.')
+        spec_list = get_specs(conf, test_name)
+        if spec_name not in spec_list:
+            error_out('Unknown spec %s' % spec_name)
+        options.remove(spec_name)
+        options.remove('-s')
+    else:
+        spec_name = 'default'
+
+    if '-p' in options:
+        phase_map = { "p": "pre_test",
+            "c": "pre_check",
+            "b": "build",
+            "d": "deploy",
+            "r": "run",
+            "t": "post_test",
+            "a": "processing" # a is for "analyze" (p already used)
+            }
+        test_phases = ""
+        try:
+            phase_chars = options[options.index('-p') + 1]
+        except IndexError:
+            error_out('Phase chars not provided after -p.')
+        for c in phase_chars:
+            try:
+                test_phases += phase_map[c] + " "
+            except:
+                error_out('Phase %s not recognized.' % c)
+        options.remove(phase_chars)
+        options.remove('-p')
+        os.environ["FUEGO_TEST_PHASES"] = test_phases
+
+    # detect whether this is a Jenkins job or not:
+    try:
+        jenkins_url = os.environ("JENKINS_URL")
+        fuego_caller = "jenkins"
+    except:
+        jenkins_url = None
+        fuego_caller = "ftc"
+        print "Notice: non-Jenkins test request detected"
+
+    print "Running test '%s' on board '%s' using spec '%s'" % (test_name, board_name, spec_name)
+
+    # check if there's a Jenkins job that matches this request
+    # Job names have the syntax: <board>.<spec>.<test_name>
+    job_name = "%s.%s.%s" % (board_name, spec_name, test_name)
+    job_dir = conf.JENKINS_HOME+"/jobs/"+job_name
+    if not os.path.isfile(job_dir+"/config.xml"):
+        print "Warning: no matching Jenkins job found.  Not populating Jenkins build directory"
+        job_dir = None
+
+    #pvar("job_dir")
+
+    print "!!! >>> Ready to run test! <<< !!!"
+
+    # make sure environment variables are set:
+
+    # export stuff from configuration into environment
+    export_list = ["FUEGO_CORE", "FUEGO_RO", "FUEGO_RW"]
+    for var in export_list:
+        os.environ[var] = conf.__dict__[var]
+
+    # construct the build_data map to hold information about this build
+    build_data = data_class()
+    build_data.board_name = board_name
+    build_data.test_name = test_name
+    build_data.testplan_name = "None"
+    build_data.spec_name = spec_name
+    build_data.testdir = test_name
+    build_data.job_name = job_name
+    build_data.workspace = conf.FUEGO_RW+"/buildzone"
+    build_data.start_time = long(time.time() * 1000)
+
+    # force these for now, but
+    # FIXTHIS - do_run_test: read flag options (e.g. reboot) from command line (from 'options')
+    build_data.reboot_flag = "false"
+    build_data.rebuild_flag = "false"
+    build_data.target_cleanup_flag = "true"
+
+    # FIXTHIS - do_run_test: set job description
+    # set job description in run json file
+    build_data.description = "Test %s run by ftc" % build_data.test_name
+
+    # export other vars (that Jenkins would export)
+    # FIXTHIS: do_run_test: variables have changed (e.g. TESTSPEC, ..)
+    os.environ["TESTPLAN"] = build_data.testplan_name
+    os.environ["JOB_NAME"] = build_data.job_name
+    os.environ["NODE_NAME"] = build_data.board_name
+    os.environ["NODE_LABELS"] = build_data.board_name
+    os.environ["Device"] = build_data.board_name
+    os.environ["TESTDIR"] = build_data.testdir
+    os.environ["WORKSPACE"] = build_data.workspace
+    os.environ["TESTSPEC"] = build_data.spec_name
+    # FIXTHIS - set this if user specifies --debug in options
+    os.environ["FUEGO_DEBUG"] = "1"
+
+    for var_name in board.env_vars.keys():
+        os.environ[var_name] = board.env_vars[var_name]
+
+    # and do synchronization with jenkins job at end, if possible
+
+    # set BUILD_NUMBER, BUILD_ID, BUILD_TAG and EXECUTOR_NUMBER
+    timestamp = time.strftime("%FT%T%z")
+    build_data.timestamp = timestamp
+
+    if job_dir:
+        build_number = find_next_build_number(job_dir)
+        pvar("build_number")
+        filename = job_dir + "/nextBuildNumber"
+        next_build_number = str(int(build_number)+1)
+        # update nextBuildNumber
+        try:
+            fd = open(filename, "w+")
+            fd.write(next_build_number+'\n')
+            fd.close()
+        except:
+            print "Error: problem writing to file %s" % filename
+    else:
+        logs_dir = conf.FUEGO_RW + "/logs/%s" % test_name
+        build_number = find_next_build_number_by_log_scan(logs_dir)
+
+    build_data.build_number = build_number
+
+    os.environ["EXECUTOR_NUMBER"] = "0"
+    os.environ["BUILD_ID"] = build_data.build_number
+    os.environ["BUILD_NUMBER"] = build_data.build_number
+    os.environ["BUILD_TIMESTAMP"] = build_data.timestamp
+
+    # logdir path is ${NODE_NAME}.${TESTSPEC}.${BUILD_NUMBER}.${BUILD_ID}
+    # FIXTHIS - do_run_test: logdir path should have timestamp in it
+    log_dir = conf.FUEGO_RW + "/logs/%(test_name)s/%(board_name)s.%(spec_name)s.%(build_number)s.%(build_number)s"  % build_data
+
+    if not os.path.isdir(log_dir):
+        os.mkdir(log_dir)
+
+    # create build_number directory
+    if job_dir:
+        run_dir = job_dir + "/builds/" + build_number
+        os.mkdir(run_dir)
+        console_log_filename = "log"
+    else:
+        run_dir = log_dir
+        console_log_filename = "consolelog.txt"
+
+    os.environ["BUILD_TAG"] = "ftc-%s-%s" % (test_name, build_number)
+
+    os.environ["JENKINS_HOME"] = conf.JENKINS_HOME
+    os.environ["JENKINS_URL"] = conf.JENKINS_URL
+
+    os.environ["Reboot"] = build_data.reboot_flag
+    os.environ["Rebuild"] = build_data.rebuild_flag
+    # FIXTHIS - do_run_test: support separate pre and post cleanup flags
+    os.environ["Target_PreCleanup"] = build_data.target_cleanup_flag
+    os.environ["Target_PostCleanup"] = build_data.target_cleanup_flag
+
+    # cd to buildzone directory
+    saved_cur_dir = os.getcwd()
+    os.chdir(build_data.workspace)
+
+    print("Running remotely on '%(board_name)s' in workspace %(workspace)s" % build_data)
+
+    # FIXTHIS - do_run_test - get timeout from testplan
+    # FIXTHIS - do_run_test - handle timeout myself in ftc_exec_command
+    command = "timeout --signal=9 30m /bin/bash $FUEGO_CORE/engine/scripts/main.sh"
+    pvar("command")
+
+    # write command to temp file, and execute that with
+    #    '/bin/sh -xe /tmp/hudson123456.sh'
+    try:
+        tempfilename = make_temp_file(command)
+    except:
+        os.chdir(saved_cur_dir)
+        error_out("Could not make temp file")
+
+    pvar("tempfilename")
+
+    # stream output to log file while test is running
+
+    # create log file
+    log_filename = run_dir + os.sep + console_log_filename
+    log = open(log_filename, "w+")
+    log.write("LOG HEADER from FTC")
+    log.flush()
+
+    # create another file descriptor for 'tail'ing  the data
+    log_tail = open(log_filename, "r")
+    tail_fd = log_tail.fileno()
+    flag = fcntl.fcntl(tail_fd, fcntl.F_GETFL)
+    fcntl.fcntl(tail_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+
+    command = "/bin/bash -xe %s" % (tempfilename)
+    # FIXTHIS - in do_run_test: timeout is hardcoded to 5 minutes
+    timeout = 300    # 5 minutes
+    rcode = ftc_exec_command(command, timeout)
+    log.flush()
+
+    build_data.result = "UNKNOWN"
+    if rcode != 0:
+        build_data.result = "FAILURE"
+
+    comment_out = """
+    # now, execute the test post_test
+    # FIXTHIS - this is hard-coded
+    post_script = "source %s/engine/scripts/functions.sh; post_test $TESTDIR" % conf.FUEGO_CORE
+    pvar("post_script")
+
+    # execute script
+    print "Running script  : %s" % post_script
+
+    # write post_script to temp file, and execute that with
+    #    '/bin/bash -xe /tmp/hudson123456.sh'
+    try:
+        tempfilename2 = make_temp_file(post_script)
+    except:
+        os.chdir(saved_cur_dir)
+        error_out("Could not write fuego post test command to temp file '%s'" % tempfilename, 1)
+
+    command2 = "/bin/bash -xe %s" % tempfilename2
+    pvar("command2")
+
+    print "[buildzone] $ %s" % command2
+
+    timeout = 60    # 1 minute is enough for the post_script
+    rcode2 = ftc_exec_command(command2, timeout)
+    pvar("rcode2")
+    """
+
+    # drain the log, in case there's more there
+    data = os.read(tail_fd, 4096)
+    while data:
+        sys.stdout.write(data)
+        data = os.read(tail_fd, 4096)
+
+    if rcode == 0:
+        build_data.result = "SUCCESS"
+
+    end_time = long(time.time() * 1000)
+    build_data.duration = end_time - build_data.start_time
+
+    # finalize saving all the run data
+    run = run_class(conf, build_data.timestamp,
+                build_data.test_name,
+                conf.host,
+                build_data.board_name,
+                run_dir,
+                build_data.build_number)
+
+    # fake a few entries
+    build_data.charset = "US-ASCII"
+    build_data.built_on = build_data.board_name
+    build_data.keep_log = "true"
+
+    # base script now writes run.json file itself
+    #run.set_run_data(build_data)
+    #run.write_run_json_file(log_dir)
+
+    # update all the Jenkins build-related files
+    if job_dir:
+        write_build_xml_file(run_dir, build_data)
+
+        # write changelog.xml file
+        filename = run_dir + "/changelog.xml"
+        fd = open(filename, "w+")
+        fd.write("<log/>")
+        fd.close()
+
+        # update last.. symlinks
+        # lastStableBuild, lastSuccessfulBuild
+        # lastUnstableBuild, lastUnsuccessfulBuild, lastFailedBuild
+        # How does Jenkins calculate UnstableBuilds?
+        if build_data.result=="SUCCESS":
+            linkname = job_dir + "/builds/lastStableBuild"
+            try:
+                os.unlink(linkname)
+            except:
+                pass
+            os.symlink(build_number, linkname)
+
+            linkname = job_dir + "/builds/lastSuccessfulBuild"
+            try:
+                os.unlink(linkname)
+            except:
+                pass
+            os.symlink(build_number, linkname)
+
+        if build_data.result=="FAILED":
+            linkname = job_dir + "/builds/lastUnsuccessfulBuild"
+            try:
+                os.unlink(linkname)
+            except:
+                pass
+            os.symlink(build_number, linkname)
+
+            linkname = job_dir + "/builds/lastFailedBuild"
+            try:
+                os.unlink(linkname)
+            except:
+                pass
+            os.symlink(build_number, linkname)
+
+        if build_data.result=="ABORTED":
+            linkname = job_dir + "/builds/lastUnsuccesfulBuild"
+            try:
+                os.unlink(linkname)
+            except:
+                pass
+            os.symlink(build_number, linkname)
+
+    os.chdir(saved_cur_dir)
+
+    # remove the tempfiles
+    os.unlink(tempfilename)
+    #os.unlink(tempfilename2)
+
+    log.close()
+    log_tail.close()
+
+    # FIXTHIS - do something to make the build/run appear in Jenkins
+    # Note: builds seem to appears when Jenkins reloads it's configuration
+
+    # return the test exit code
+    sys.exit(rcode)
+
+
+def do_query_board(bvars, options):
+    global verbose
+
+    attrs = bvars.keys()
+    attrs.sort()
+    board_name = bvars["board"]
+
+    # print a single data item, if requested
+    if '-n' in options:
+        attr = options[options.index('-n')+1]
+        options.remove('-n')
+        options.remove(attr)
+        try:
+            value = bvars[attr]
+        except:
+            error_out("board '%s' has no attribute '%s'." % (board_name, attr), 1)
+        print dequote(value)
+        return
+
+    print "Information for board: %s\n" % board_name
+    attrs.remove("board")
+
+    if bvars.has_key("description"):
+        desc = bvars["description"]
+        print desc
+        attrs.remove("description")
+
+#   if not verbose:
+#       # just print description, nothing more
+#       return
+
+
+    for attr in attrs:
+        #print("DEBUG: attr=%s" % attr)
+        value = bvars[attr]
+        if value.find('\n')==-1:
+            # print single-line value
+            print "%25s : %s" % (attr, bvars[attr])
+        else:
+            # print multi-line value
+            lines = value.split('\n')
+            print "%25s : %s" % (attr, lines[0])
+            # subsequent lines are indented
+            for line in lines[1:]:
+                print " "*28 + line
+
+    sys.exit(0)
+
+# convert '\n' and '\t' character sequences into newlines and tabs,
+def format_value(data):
+    return data.replace('\\n','\n').replace('\\t','\t')
+
+# put the variable in the file
+# op has one of:
+#  w = write line to file
+#  r = replace line in file (only, don't add the line if it's not already there)
+#  d = delete line from file
+#  o = add an override for the variable (replacing one if already there)
+#    ('o' is not implemented yet)
+def set_variable_in_file(path, op, name, value):
+    global quite, verbose
+
+    import tempfile
+
+    out = tempfile.NamedTemporaryFile(delete=False)
+    tmp_path = out.name
+    #pvar("tmp_path")
+    #pvar("path")
+    try:
+        lines = open(path,"r").readlines()
+    except:
+        line = 'inherit "base-vars"\n'
+        fd = open(path, "w")
+        fd.write(line+'\n')
+        fd.close()
+        os.chmod(path, 0644)
+        lines = [line,'\n']
+
+    # can update "function_foo" (preferred) or "function foo"
+    # have to match in file on space, though: i.e. "function foo"
+    if name.startswith("function"):
+        name = name.replace('_',' ')
+
+    # make a pattern to catch the variable name or function definition
+    pat = "(^# |^)%s[ =(]" % name
+
+    # silly humans might use more than one space
+    pat = pat.replace(' ', '\s+')
+
+    ov_pat=None
+    if name.startswith("function"):
+        func_name = name[8:].strip()
+        ov_pat = "(^# |^)override-func\s+%s[ =]" % func_name
+    else:
+        ov_pat = "(^# |^)override\s+%s[ =]" % name
+    in_block = 0
+
+    if name.startswith("function"):
+        new_data = format_value(value+'\n')
+    else:
+        new_data = '%s="%s"\n' % (name, value)
+
+    # scan file for config
+    found = 0
+    for line in lines:
+        if re.match(pat,line):
+            # replace this line or block in the output
+            found = 1
+            if name.startswith("function"):
+                in_block = 1
+            if op!='d':
+                out.write(new_data)
+            continue
+
+        # don't copy lines, until the end of the block
+        if in_block:
+            if line.lstrip().startswith('}'):
+                in_block=0
+            continue
+
+        # FIXTHIS - don't handle overrides yet
+        #if ov_pat and re.match(ov_pat, line):
+        #   # replace this line in the output
+        #   found = 1
+        #   new_line = 'override %s="%s"\n' % (name, value)
+        #   if op!='d':
+        #       out.write(new_line)
+        #   continue
+
+        out.write(line)
+
+    if not found:
+        if op=="r":
+            error_out("Missing %s, cannot append value %s" % (name, value), 1)
+        elif op=="d":
+            error_out("Missing %s, cannot delete it" % name, 1)
+        else:
+            out.write(new_data)
+
+    out.close()
+
+    # rename doesn't work across distinct file systems
+    # have to use delete and move instead
+
+    # save previous file's stats (uid, perms, etc.)
+    old_stats = os.stat(path)
+
+    os.unlink(path)
+    shutil.move(tmp_path, path)
+
+    # give the new file the same owner and perms it had before
+    # depending on who's running this tool, it might not work,
+    # but at least try...
+    try:
+        os.chmod(path, old_stats.st_mode)
+        os.chown(path, old_stats.st_uid, old_stats.st_gid)
+    except:
+        pass
+
+# there are three options for setting a variable:
+# variable can be:
+#   missing, present, or an override
+#
+# if missing, add variable at end of file
+# if there's an override, put new value in place of the override
+# if it's present, put new value in it's place
+#
+def do_set_var(bvars, options):
+    global verbose
+
+    str = options[0]
+    if str.find("=")!=-1:
+        name, value = str.split('=', 1)
+        name = name.strip()
+    elif str.startswith("function") and str.find("(")!=-1:
+        name, rest = str.split('(', 1)
+        name = name.strip()
+        value = str
+        name
+    else:
+        error_out("Invalid value for ftc set: '%s'" % str, 1)
+
+    path = bvars["var_path"]
+    set_variable_in_file(path, 'w', name, value)
+    if verbose:
+        print('Set %s="%s"' % (name, value))
+
+def do_delete_var(bvars, options):
+    global verbose
+
+    name = options[0].strip()
+
+    path = bvars["var_path"]
+    set_variable_in_file(path, 'd', name, "nothing")
+    if verbose:
+        print("Deleted variable %s" % name)
+
+def inside_docker():
+    data = open("/proc/1/cgroup").read()
+    if data.find(":/docker/") == -1:
+        return False
+    else:
+        return True
+
+# Here's a convenience function to allow running ftc outside the container
+def container_command(command):
+    # get name of docker container
+    if os.environ.has_key("FUEGO_CONTAINER"):
+        fuego_container=os.environ["FUEGO_CONTAINER"]
+    else:
+        # use the first container with "fuego" in the image or container name
+        # if none found, use "fuego-container"
+        fuego_container="fuego-container"
+        dps_lines=commands.getoutput("docker ps").split('\n')
+        for line in dps_lines:
+            if "fuego" in line:
+                fuego_container=line.strip().split(" ")[-1]
+                break
+
+    cont_cmd="sudo docker exec %s %s" % (fuego_container, command)
+    (rcode, result) = commands.getstatusoutput(cont_cmd)
+    print result
+    sys.exit(rcode)
+
+def exec_command(bmap, command, use_system=1):
+    global verbose
+    global quiet
+    global use_statusoutput
+
+    cmd_block = ""
+    try:
+        cmd_block = bmap[command+"_cmd"]
+    except:
+        pass
+
+    if not cmd_block:
+        print_error('%s_cmd not configured for board %s' % (command, bmap["board"]))
+
+    # cmd can be a single line, or a list of commands to run
+    # lines can be continued with a trailing \
+    cmds = cmd_block.split('\n')
+    full_cmd = ""
+    for cmd in cmds:
+        if verbose:
+            print "cmd=", cmd
+        cmd = cmd.strip()
+        if not cmd:
+            continue
+        full_cmd += cmd
+        if full_cmd.endswith("\\"):
+            full_cmd += '\n'
+            continue
+
+        if verbose:
+            print "full_cmd={{{",full_cmd
+            print "}}}"
+
+        saved_cmd = full_cmd
+        # execute full_cmd
+        if use_system and not use_statusoutput:
+            rcode = os.system(full_cmd)
+            full_cmd = ""
+            result = ""
+        else:
+            (rcode, result) = commands.getstatusoutput(full_cmd)
+            full_cmd = ""
+        if not quiet:
+            if verbose:
+                print "result=",
+            print result,
+            try:
+                sys.stdout.flush()
+            except:
+                pass
+        if rcode:
+            print_error('Bad result %d, running "%s": (output follows)' % (rcode, saved_cmd))
+            print_error(result)
+            sys.exit(2)
+
+    if full_cmd:
+        error_out('Error - trailing slash on last non-empty line of %s_cmd\nCommand was NOT executed.' % command, 3)
+
+def do_status(bmap):
+    board = bmap["board"]
+
+    print "Status for board: %s" % board
+
+    # show who is currently using board
+    res = get_reservation(bmap)
+    if res[0]:
+        print "User %s currently has '%s' reserved." % (res[0], board)
+        print "Reservation began at: %s" % res[1]
+    else:
+        print "Board '%s' is not reserved." % (board)
+
+    # FIXTHIS - should report:
+    #   board power-on status
+    #   whether board is running linux (pingable?)
+    #   future reservations for board
+
+# set the vars from bmap into the current environment
+# if options list has "-o", output the env as a list of shell export statements
+# if options list has "-s", start a sub-shell
+#
+# variable precedence:
+#   value from 'board' command line = highest precedence
+#   value from pre-existing environment = medium precedence
+#   value from <board>.board file = lowest precendence
+#
+# This means that effectively, board commands don't "nest" if
+# a different board is specified.  This is because the <board>.board
+# values for a new board would not override the values in the
+# sub-shell environment of the first board.
+# (i.e. bad things will happen if you do: "ftc setenv osk", then
+#   "ftc ebony getkernel ; make $kimage" )
+#
+def do_setenv(bmap, options=[]):
+    if "-s" in options:
+        print "Setting environment for board: %s" % bmap["board"]
+
+    # set board name in new shell environment
+    os.environ[BOARD_ENV_VAR] = bmap["board"]
+
+    # copy certain environment vars for the new shell
+    env_list = ["ARCH", "CROSS_COMPILE", "kimage", "INSTALL_PATH",
+        "INSTALL_MOD_PATH", "ADBHOST", "BUILDDIR",
+        "KERNEL_SRC", "KBUILD_OUTPUT", "TOOL_PATH", "TMPDIR"]
+
+
+    for var in env_list:
+        if bmap.has_key(var) and bmap[var] and not os.environ.has_key(var):
+            os.environ[var]=bmap[var]
+
+    # add TMPDIR if not already present
+    if not os.environ.has_key("TMPDIR"):
+        os.environ["TMPDIR"] = "/tmp"
+
+    # if TOOL_PATH is present, add it to regular PATH, if not already there
+    if bmap.has_key("TOOL_PATH"):
+        tool_path = bmap["TOOL_PATH"]
+        PATH = os.environ["PATH"].split(":")
+        for tool_path_item in tool_path.split(":"):
+            if tool_path_item not in PATH:
+                PATH.append(tool_path_item)
+        os.environ["PATH"] = string.join(PATH,":")
+        # DEBUG
+        #print "os.environ['PATH']=", os.environ["PATH"]
+
+    # if output of export list is requested, do that
+    if "-o" in options:
+        export_list = env_list + ["PATH", BOARD_ENV_VAR]
+        for var in export_list:
+            if os.environ.has_key(var):
+                value = os.environ[var]
+                # escape spaces
+                value = re.sub(" ","\ ",value)
+                print "export %s=%s" % (var, value)
+        return
+
+    # do sanity checks, or other environment setup, if configured
+    # note that setenv is called every time ftc is run, so this can
+    # be used as a global environment sanity check over anything
+    # you probably shouldn't do something persistent here
+    if bmap.has_key("setenv_cmd"):
+        exec_command(bmap, "setenv", 1)
+
+    if "-s" in options:
+        # start a new shell with the modified environment
+        # FIXTHIS - add TTC to prompt
+        #print "os.environ=", os.environ
+        #prompt = os.environ["PS1"]
+        #prompt = prompt[0] + "TTC " + prompt[1:]
+        #os.environ["PS1"] = "[TTC \\u@\\h \\W]\\$ "
+
+        # FIXTHIS - should get user's preferred shell from /etc/passwd
+        print "Starting sub-shell with environment for board."
+        print "Use 'exit' to exit the sub-shell."
+        os.system("/bin/bash")
+
+def config_val(op, config, value, line):
+    if op=="y" or op=="m" or op=="1" or op=="s":
+        new_val = "%s=%s\n" % (config, value)
+    if op=="n":
+        new_val = "# %s is not set\n" % (config)
+    if op=="s+":
+        #print "line=", line
+        # split the line (once) on '=' and take the second part
+        old_val = line.split("=", 1)[1]
+
+        # trim the quotes
+        old_str = old_val.strip()[1:-1]
+        new_str = value.strip()[1:-1]
+
+        # append the old string and new string
+        new_val = '%s="%s%s"\n' % (config, old_str, new_str)
+        #print "old_val=", old_val
+        #print "new_val=", new_val
+    return new_val
+
+
+def set_config_value_in_file(path, op, config, value):
+    import tempfile
+
+    out = tempfile.NamedTemporaryFile(delete=False)
+    tmp_path = out.name
+    lines = open(path,"r").readlines()
+
+    pat = "(^# |^)%s[ =]" % config
+    # scan file for config
+    found = 0
+    for line in lines:
+        if re.match(pat,line):
+            # replace this line in the output
+            found = 1
+            new_val = config_val(op, config, value, line)
+            out.write(new_val)
+            continue
+        out.write(line)
+
+    if not found:
+        if op=="s+":
+            print "error: missing %s, cannot append value %s" % (config, value)
+            sys.exit(1)
+        else:
+            new_val = config_val(op, config, value, line)
+            out.write(new_val)
+
+    out.close()
+
+    # rename doesn't work across distinct file systems
+    os.unlink(path)
+    shutil.move(tmp_path, path)
+
+def do_set_config(bmap, kernel_dir, kopts):
+    # kopt should be a list of option specs, separated by semi-colons
+    # eg. CONFIG_FOO=y CONFIG_BAR=n CONFIG_BAZ=1235 CONFIG_STR+=" quiet"
+    # back up the .config file
+    cfile = kernel_dir+"/.config"
+    bfile = kernel_dir+"/config.board-bak"
+    print "Backing up current config file to %s" % os.path.basename(bfile)
+    cmd = "cp %s %s" % (cfile, bfile)
+    (rcode, result) = commands.getstatusoutput(cmd)
+
+    # now set the vars.
+    for kopt_spec in kopts:
+        print "  Setting %s" % kopt_spec
+        try:
+            (config, value)=kopt_spec.split("=", 1)
+        except:
+            print "Invalid option specification: %s" % kopt_spec
+            continue
+        # detect '+=' operation
+        value = value.strip()
+        op = value[0]
+        if op == '"':
+            op = 's'
+        if config[-1]=="+":
+            config = config[:-1]
+            op = "s+"
+        op = op.lower()
+        if op>='0' and op<='9':
+            op = '1'
+        # check op for legal value:
+        if op not in ('y','n','m','s','s+','1'):
+            print "Invalid option specification: %s" % kopt_spec
+            continue
+        set_config_value_in_file(cfile, op, config, value)
+
+
+def split_filepath(filepath):
+    # FIXTHIS - split_filepath doesn't handle ':' in file names or paths
+    try:
+        (tspec, path) = filepath.split(':')
+    except:
+        tspec = ''
+        path = filepath
+    return (tspec, path)
+
+def do_wait_for(options):
+    import time
+
+    interval = 5
+    # 99999 seconds is a little over 27 hours
+    timeout = 99999
+    if '-i' in options:
+        interval = int(options[options.index('-i')+1])
+        options.remove('-i')
+        options.remove(str(interval))
+    if '-t' in options:
+        timeout = int(options[options.index('-t')+1])
+        options.remove('-t')
+        options.remove(str(timeout))
+
+    cmd = options[0]
+    print 'Waiting (up to %d seconds) for "%s"...' % (timeout, cmd)
+
+    i = 0
+    while i < timeout:
+        rcode = os.system(cmd) >> 8
+        if rcode==0:
+            break
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        time.sleep(interval)
+        i = i + interval
+    print
+    sys.exit(rcode)
+
+
+def do_package_run(conf, options):
+    try:
+        run_id = options[0]
+        del options[0]
+    except:
+        print_error("Must specify a run to package")
+        usage(1, ["package-run"])
+
+    output_dir = os.getcwd()
+    if "-o" in options:
+        output_dir = options[options.index("-o")+1]
+        options.remove(output_dir)
+        options.remove("-o")
+        if not os.path.isdir(output_dir):
+            error_out("Invalid output directory '%s'" % output_dir)
+
+    # check that the run is present
+    runs_map = get_runs(conf)
+    if not run_id in runs_map.keys():
+        error_out("Unrecognized test '%s' specified" % run_name, 1)
+
+    print("Packaging run '%s'" % run_id)
+
+    run = runs_map[run_id]
+
+    # use run.json file to create tar file
+    # if not present, create from build.xml file
+    test_home = conf.FUEGO_CORE + '/engine/tests'
+
+    # create temp dir, with name "run"
+    tempdir = tempfile.mkdtemp(dir="/tmp")
+    tmp_run_dir = tempdir + "/run"
+    os.mkdir(tmp_run_dir)
+
+    # put run.json, logs, and build.xml in it
+    run.get_run_data_from_buildxml()
+    run.write_run_json_file(tmp_run_dir)
+
+    #print run.__dict__
+
+    copy2(run.get_testlog_path(), tmp_run_dir+"/testlog.txt")
+    copy2(run.get_devlog_path(), tmp_run_dir+"/devlog.txt")
+    copy2(run.get_systemlog_path("before"), tmp_run_dir+"/syslog.before.txt")
+    copy2(run.get_systemlog_path("after"), tmp_run_dir+"/devlog.after.txt")
+    copy2(run.get_consolelog_path(), tmp_run_dir+"/consolelog.txt")
+    copy2(run.get_buildxml_path(), tmp_run_dir+"/build.xml")
+
+    #print("some data should be in %s" % tmp_run_dir)
+
+    # do tar command
+    # tar -C <temp_dir> -czvf <package_name> run
+    pkg_path = output_dir+os.sep+"run-%s.frp" % run.run_id
+    cmd = "tar -C %s -czvf %s run" % (tempdir, pkg_path)
+    #print("About to execute command: '%s'" % cmd)
+    rcode = os.system(cmd)
+    if rcode != 0:
+        error_out("Problem creating run package '%s'" % pkg_path)
+    print "Run packaged successfully, and is at: %s" % pkg_path
+
+    # cleanup temp run directory
+    shutil.rmtree(tempdir, ignore_errors=False)
+
+    return pkg_path
+
+def do_package_test(conf, options):
+    import yaml
+
+    try:
+        test_name = options[0]
+        del options[0]
+    except:
+        print_error("Must specify a test to package")
+        usage(1, ["package-test"])
+
+    output_dir = os.getcwd()
+    if "-o" in options:
+        output_dir = options[options.index("-o")+1]
+        options.remove(output_dir)
+        options.remove("-o")
+        if not os.path.isdir(output_dir):
+            error_out("Invalid output directory '%s'" % output_dir)
+
+    # check that the test is present
+    tests_map = get_tests(conf)
+    if not test_name in tests_map.keys():
+        error_out("Unrecognized test '%s' specified" % test_name, 1)
+
+    print("Packaging test '%s'" % test_name)
+
+    # use test.yaml file to create tar file
+    test_home = conf.FUEGO_CORE + '/engine/tests'
+    testdir = test_home + os.sep + test_name
+    filepath = testdir + os.sep + "test.yaml"
+    try:
+        filetxt = open(filepath).read()
+    except:
+        error_out("Problem reading '%s'" % filepath, 1)
+
+    try:
+        test_data = yaml.safe_load(filetxt)
+    except yaml.YAMLError as exc:
+        if hasattr(exc, "problem_mark"):
+            error_out("YAML error in file '%s'\n  %s\n  %s\n  %s" % (filepath, exc.problem_mark, exc.problem, exc.context), 1)
+        else:
+            error_out("Unknown YAML error in file '%s'" % filepath, 1)
+
+    #pvar("test_data")
+
+    # do some sanity checking of the package data here
+    if not test_data.has_key("fuego_package_version"):
+        error_out("Missing fuego_package_version in test.yaml file")
+    if test_data["fuego_package_version"] != 1:
+        error_out("Invalid fuego_package_version in test.yaml file")
+
+    if not test_data.has_key("name"):
+        error_out("Missing test name in test.yaml file")
+    if test_data["name"] != test_name:
+        error_out("Inconsistent test name in test.yaml file. Expected '%s' but saw '%s'" % (test_name, test_data["name"]))
+
+    try:
+        version = test_data["version"]
+    except:
+        error_out("Missing test version in test.yaml file")
+
+    try:
+        fuego_release = test_data["fuego_release"]
+    except:
+        error_out("Missing fuego_release in test.yaml file")
+
+    try:
+        data_files = test_data["data_files"]
+    except:
+        error_out("Missing data_files list in test.yaml file")
+
+    if type(data_files) != type([]):
+        error_out("data_files must be a list in test.yaml file")
+
+    # check that listed data files are present
+    for filename in data_files:
+        if not os.path.exists(testdir + os.sep + filename):
+            error_out("Missing file '%s' in test directory" % filename)
+
+    base_script = "fuego_test.sh"
+
+    # FIXTHIS - do more sanity checking of the package data here
+
+    # make the package name
+    pkg_name="%s-%s-%s.ftp" % (test_name, version, fuego_release)
+    pkg_path=output_dir + os.sep + pkg_name
+
+    # build the file list for tar
+    file_list = ["test.yaml"]
+    file_list += data_files
+    file_list.append(base_script)
+
+    path_list = []
+    for file in file_list:
+        path_list.append(test_name + os.sep + file)
+
+    path_list_str = " ".join(path_list)
+
+    # prevent overwriting an existing package
+    if os.path.exists(pkg_path) and "-f" not in options:
+        error_out("Package file %s already exists, aborting.\nUse -f to force overwrite." % pkg_path)
+
+    # do tar command
+    # tar -C <testdir> -czvf <package_name> <path_list>
+    cmd = "tar -C %s -czvf %s %s" % (test_home, pkg_path, path_list_str)
+    #print("About to execute command: '%s'" % cmd)
+    rcode = os.system(cmd)
+    if rcode != 0:
+        error_out("Problem creating test package '%s'" % pkg_path)
+    print "Test packaged successfully, and is at: %s" % pkg_path
+    return pkg_path
+
+def do_install_test(conf, options):
+    import yaml
+
+    upgrade = 0
+    if "-u" in options:
+        upgrade = 1
+        options.remove("-u")
+
+    test_home = conf.FUEGO_CORE + '/engine/tests'
+
+    test_pkg = options[0]
+    if not os.path.isfile(test_pkg):
+        error_out("Test package '%s' is not found" % test_pkg)
+
+    # this assumes no test name has a dash - probably a bad assumption
+    test_name, rest = test_pkg.split("-",1)
+
+    testdir = test_home + os.sep + test_name
+    if os.path.exists(testdir) and not upgrade:
+        error_out("Test '%s' is already present - not installing" % test_name)
+
+    print("Installing test pkg '%s'" % test_pkg)
+
+    abs_pkg_path=os.path.abspath(test_pkg)
+
+    # FIXTHIS - if upgrading, remove old test
+    if upgrade and os.path.exists(testdir):
+        print("FIXTHIS - should delete old test first")
+        #do_package_delete(conf, test_name)
+
+    # use test.yaml file to create tar file
+
+    cmd = "tar -C %s -xzvf %s" % (test_home, abs_pkg_path)
+    #print "About to execute command: '%s'" % cmd
+    os.system(cmd)
+    rcode = 0
+
+    filepath = testdir + os.sep + "test.yaml"
+    # do some sanity checking with the test.yaml file
+
+    print "### FIXTHIS - should add config.xml for test to Jenkins ###"
+    # FIXTHIS - should now do some sanity checking of the installed
+    # package, and any post-processing that needs to occur.
+    sys.exit(rcode)
+
+# if running as root, switch to jenkins
+# for now, use sudo, but could change to use direct setuid calls
+def user_check():
+    import getpass
+
+    new_user = "jenkins"
+    if getpass.getuser() == "root":
+        cmd = ["sudo", "-u", new_user, "python"] + sys.argv
+        rcode = subprocess.call(cmd)
+        sys.exit(rcode)
+
+def main():
+    global verbose
+    global quiet
+    global use_statusoutput
+
+    # for now, run commands only inside the docker container
+    # FIXTHIS - support running ftc outside the container (using an appropriate config)
+    if not inside_docker():
+        command = "ftc "
+        # accumulate args, and quote if needed
+        for arg in sys.argv[1:]:
+            if " " in arg:
+                arg = '"'+arg+'"'
+            if arg=="rm-jobs":
+                print "Can't do rm-jobs outside the container! Aborting."
+                sys.exit(1)
+            command += arg + " "
+        container_command(command)
+
+    if len(sys.argv)<2:
+        error_out('Missing command\nUse "ftc help" to get usage help.', 1)
+
+    # parse arguments
+    command_list = command_help.keys()
+    command_list.extend(["--help", "-h", "add-job", "rm-job", "build-job",
+        "add-node", "rm-node"])
+    options = []
+
+    board = ""
+    command = ""
+    quiet = 0
+    verbose = 0
+    use_statusoutput = 0
+    # find command, board, and any arguments
+    for arg in sys.argv[1:]:
+        if arg=="-q":
+            quiet = 1
+            continue
+        if arg=="-v":
+            verbose = 1
+            continue
+        if arg=="-c":
+            use_statusoutput = 1
+            continue
+        if arg in command_list:
+            # support "ftc <command> help"
+            if (arg=="help" or arg=="-h" or arg=="--help") and command:
+                options.append(command)
+                command = arg
+                continue
+
+            # support "ftc help <command>" and "ftc run reboot"
+            # -- where arg has same name as a legal ttc command
+            if command:
+                # this is an argument to the command
+                # which was already found
+                # note: check for 'help' arg (above) must come first
+                options.append(arg)
+            else:
+                # normal "ftc <command>" case
+
+                command = arg
+            continue
+
+        options.append(arg)
+
+    # if no command recognized, return
+    if not command:
+        error_out('Missing or unregonized command\nUse "ftc help" to get usage help.', 1)
+
+    if command=="help" or command=="--help" or command=="-h":
+        usage(0, options)
+
+    if command=="version":
+        print "ftc: version %d.%d.%d" % VERSION
+        sys.exit(0)
+
+    # read config
+    conf = config_class(config_dir + os.sep + CONFIG_FILE)
+
+    if command.startswith("add-job"):
+        # adds Jenkins jobs
+        user_check()
+        try:
+            do_add_jobs(conf, options)
+        except Exception as e:
+            sys.exit(str(e) + '\n' + command_help['add-jobs'][1])
+
+    if command.startswith("rm-job"):
+        # removes Jenkins jobs
+        user_check()
+        try:
+            do_rm_jobs(conf, options)
+        except Exception as e:
+            sys.exit(str(e) + '\n' + command_help['rm-jobs'][1])
+
+    if command.startswith("add-node"):
+        # adds Jenkins nodes
+        user_check()
+        try:
+            do_add_nodes(conf, options)
+        except Exception as e:
+            sys.exit(str(e) + '\n' + command_help['add-nodes'][1])
+
+    if command.startswith("rm-node"):
+        # removes Jenkins nodes
+        user_check()
+        try:
+            do_rm_nodes(conf, options)
+        except Exception as e:
+            sys.exit(str(e) + '\n' + command_help['rm-nodes'][1])
+
+    if command=="list-boards":
+        # shows fuego boards
+        do_list_boards(conf)
+
+    if command=="list-nodes":
+        # shows jenkins nodes
+        user_check()
+        do_list_nodes(conf)
+
+    if command=="list-jobs":
+        # shows jenkins jobs
+        user_check()
+        do_list_jobs(conf)
+
+    if command.startswith("build-job"):
+        # build jenkins jobs
+        do_build_jobs(conf, options)
+
+    if command=="add-view":
+        do_add_view(conf, options)
+
+    if command=="list-plans":
+        do_list_plans(conf)
+
+    if command=="list-specs":
+        do_list_specs(conf, options)
+
+    if command=="list-tests":
+        do_list_tests(conf)
+
+    if command=="list-requests":
+        do_list_requests(conf, options)
+
+    if command=="list-runs":
+        do_list_runs(conf, options)
+
+    if command=="gen-report":
+        do_gen_report(conf, options)
+
+    if command=="wait-for":
+        do_wait_for(options)
+
+    if command=="package-test":
+        pkg_path = do_package_test(conf, options)
+        sys.exit(0)
+
+    if command=="package-run":
+        pkg_path = do_package_run(conf, options)
+        sys.exit(0)
+
+    if command=="install-test":
+        do_install_test(conf, options)
+
+    if command=="run-request":
+        do_run_request(conf, options)
+
+    if command=="put-request":
+        do_put_request(conf, options)
+
+    if command=="put-test":
+        do_put_test(conf, options)
+        sys.exit(0)
+
+    if command=="put-run":
+        do_put_run(conf, options)
+        sys.exit(0)
+
+    if command=="run-test":
+        # switch users, if needed
+        user_check()
+        do_run_test(conf, options)
+        sys.exit(0)
+
+    # all non-board commands have been handled
+    #if command in board_mod_commands:
+    #   check_reservation(bmap, command)
+
+    bmap = get_fuego_boards(conf)
+    if not options:
+        error_out("Command requires a board name")
+
+    board_name = options[0]
+    del options[0]
+
+    if not board_name in bmap.keys():
+        error_out("Unrecognized board '%s' specified" % board_name)
+    else:
+        board = bmap[board_name]
+        bvars = get_board_vars(board, conf)
+
+    # do local environment setup
+    #do_setenv(tvars)
+
+    # process the command
+    if command=="query-board":
+        do_query_board(bvars, options)
+        sys.exit(0)
+
+    if command=="set-var":
+        do_set_var(bvars, options)
+        sys.exit(0)
+
+    if command=="delete-var":
+        do_delete_var(bvars, options)
+        sys.exit(0)
+
+    error_out("Unknown command %s" % command)
+
+# some miscelaneous holdover routines from ttc
+#   # need fixes from here down...
+#   if command=="status":
+#       do_status(tmap)
+#
+# some miscelaneous holdover routines from ttc
+#   do_reserve(bmap, options)
+#   do_release(bmap, options)
+
+if __name__=="__main__":
+    main()

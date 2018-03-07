@@ -1,0 +1,45 @@
+From 0139ac5a91ae97e55b9e5e824ffe00db1a88a862 Mon Sep 17 00:00:00 2001
+From: Hoang Van Tuyen <tuyen.hoangvan@toshiba-tsdv.com>
+Date: Mon, 5 Feb 2018 19:17:57 +0700
+Subject: [PATCH] ftc: Correct info about using --where option
+
+In list-runs and gen-report command_helps, It had examples for where option
+like below:
+--where test=Benchmark.bonnie,board=beaglebone
+But, the value of test should be bonnie, not include test type Benchmark.
+This patch updates the help to avoid misunderstanding for using --where option.
+
+Signed-off-by: Hoang Van Tuyen <tuyen.hoangvan@toshiba-tsdv.com>
+---
+ engine/scripts/ftc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/engine/scripts/ftc b/engine/scripts/ftc
+index bde3694..0d162e1 100755
+--- a/engine/scripts/ftc
++++ b/engine/scripts/ftc
+@@ -165,8 +165,8 @@ command_help = {
+   Allowed operators are: '=','<','<=','>','>=','!=','=~'.  The '=~' operator
+   means the value is a regular expression to match, for the indicated field.
+   Here are some example where options:
+-     --where test=Functional.LTP
+-     --where test=Benchmark.bonnie,board=beaglebone
++     --where test=LTP
++     --where test=bonnie,board=beaglebone
+      --where "start_time>2 hours ago"
+   """),
+ 
+@@ -312,8 +312,8 @@ the 'foo' function from the board file, you would use do this:
+   Allowed operators are: '=','<','<=','>','>=','!=','=~'.  The '=~' operator
+   means the value is a regular expression to match, for the indicated field.
+   Here are some example where options:
+-     --where test=Functional.LTP
+-     --where test=Benchmark.bonnie,board=beaglebone
++     --where test=LTP
++     --where test=bonnie,board=beaglebone
+      --where "start_time>2 hours ago"
+      --where batch_id=12
+   """),
+-- 
+2.1.4
+
